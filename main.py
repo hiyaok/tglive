@@ -2557,11 +2557,12 @@ def main():
         # Register text message handler
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
         
-        # Properly set up job queue with post_init
-        application.post_init = check_active_recordings_on_startup
-        
         logger.info("Starting bot...")
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        # Pass the post_init function directly to run_polling method
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            post_init=check_active_recordings_on_startup
+        )
     except Exception as e:
         logger.error(f"Critical error in main function: {e}")
         # Stop Telethon event loop
