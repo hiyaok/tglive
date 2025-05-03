@@ -2525,8 +2525,8 @@ async def setup_job_queue(application):
     logger.info(f"Job queue set up with check interval: {check_interval} minutes")
     return job_queue
 
-async def main():
-    """Start the bot asynchronously"""
+def main():
+    """Start the bot"""
     global telethon_runner
     
     try:
@@ -2557,19 +2557,14 @@ async def main():
         # Register text message handler
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
         
-        # Set up job queue
-        await setup_job_queue(application)
-        
-        # Check for active recordings that were interrupted
-        await check_active_recordings_on_startup(application)
+        # Define setup function that we'll run on startup
+        async def setup(app):
+            await setup_job_queue(app)
+            await check_active_recordings_on_startup(app)
         
         logger.info("Starting bot...")
-        # Start the application
-        await application.start()
-        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        
-        # Run the bot until the user presses Ctrl-C
-        await application.updater.idle()
+        # Start the application, passing our setup function to post_init
+        application.run_polling(allowed_updates=Update.ALL_TYPES, post_init=setup)
         
     except Exception as e:
         logger.error(f"Critical error in main function: {e}")
@@ -2579,17 +2574,14 @@ async def main():
         # Try to restart the bot after a delay
         logger.info("Restarting bot in 10 seconds...")
         time.sleep(10)
-        # IMPORTANT: Use os.execl to restart the process instead of trying to call asyncio.run again
+        # Use os.execl to restart the process
         os.execl(sys.executable, sys.executable, *sys.argv)
 
-# Update the launcher code at the bottom of the file
+# Keep this part the same
 if __name__ == "__main__":
     # Initialize event loop for main thread
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     
-    try:
-        # Run the bot using asyncio.run - ONLY CALL THIS ONCE in the entire program
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
+    # Run the bot
+    main()  # Notice we're not using asyncio.run() anymore
