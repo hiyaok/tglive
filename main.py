@@ -2534,7 +2534,7 @@ def start_telethon_client():
     telethon_client = TelegramClient('tiktok_recorder_session', API_ID, API_HASH, loop=telethon_loop)
     
     # Connect and check authorization
-    telethon_loop.run_until_complete(telethon_client.connect())
+    telethon_loop.run_until_complete(telethon_client.start())
     
     if not telethon_loop.run_until_complete(telethon_client.is_user_authorized()):
         logger.warning("Telethon client not authorized. Please run the auth script first.")
