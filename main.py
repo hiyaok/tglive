@@ -70,7 +70,59 @@ DB_FILE = Path("database.json")
 COOKIES_FILE = Path("cookies.json")
 
 # Initialize Telethon client
-telethon_client = TelegramClient('tiktok_recorder_session', API_ID, API_HASH)
+telethon_client = None
+telethon_loop = None
+
+# Class buat handle Telethon loop di background
+class TelethonLoopRunner:
+    def __init__(self):
+        self.thread = None
+        self.running = False
+        
+    def start(self):
+        if self.running:
+            return
+        
+        def run_loop():
+            global telethon_loop
+            asyncio.set_event_loop(telethon_loop)
+            telethon_loop.run_forever()
+            
+        self.thread = threading.Thread(target=run_loop, daemon=True)
+        self.thread.start()
+        self.running = True
+        
+    def stop(self):
+        if not self.running:
+            return
+        telethon_loop.call_soon_threadsafe(telethon_loop.stop)
+        self.thread.join(timeout=5)
+        self.running = False
+
+telethon_runner = None
+
+# Function buat jalanin fungsi async di loop Telethon dari thread lain
+def run_in_telethon_loop(coro):
+    if asyncio.get_event_loop() == telethon_loop:
+        # Jika sudah di telethon_loop, jalankan langsung
+        return telethon_loop.run_until_complete(coro)
+    else:
+        # Kalau dari thread lain, jadwalkan ke telethon_loop
+        future = asyncio.run_coroutine_threadsafe(coro, telethon_loop)
+        return future.result(timeout=180)  # 3 menit timeout untuk handle file gede
+
+def initialize_telethon():
+    global telethon_client, telethon_loop
+    # Buat satu event loop dedicated khusus untuk Telethon
+    telethon_loop = asyncio.new_event_loop()
+    # Buat client dengan loop yang dedicated
+    telethon_client = TelegramClient('tiktok_recorder_session', API_ID, API_HASH, loop=telethon_loop)
+    # Connect client di loop yang sama
+    telethon_loop.run_until_complete(telethon_client.connect())
+    if not telethon_loop.run_until_complete(telethon_client.is_user_authorized()):
+        logger.warning("Telethon client not authorized. Please run the auth script first.")
+    else:
+        logger.info("Telethon client connected and authorized successfully!")
 
 # Enum Mode
 class Mode:
@@ -179,6 +231,19 @@ def get_or_create_eventloop():
 def run_async(coro):
     loop = get_or_create_eventloop()
     return loop.run_until_complete(coro)
+
+def is_recording_active(username):
+    """Check if there's an actual recording process running for this username"""
+    # Simple check: look for running ffmpeg processes for this username
+    try:
+        if os.name == 'nt':  # Windows
+            output = subprocess.check_output(f'tasklist /FI "IMAGENAME eq ffmpeg.exe"', shell=True).decode()
+            return username in output
+        else:  # Linux/Mac
+            output = subprocess.check_output(f"ps aux | grep ffmpeg | grep {username}", shell=True).decode()
+            return len(output.strip().split('\n')) > 1  # More than just the grep process itself
+    except:
+        return False  # If error, assume not recording
 
 # HTTP Client
 class HttpClient:
@@ -710,17 +775,16 @@ class TikTokRecorder:
                     # Create proper notification message
                     notification_message = (
                         f"🔴 Started recording livestream for @{self.user}\n\n"
-                        f"🆔 Room ID: `{self.room_id}`\n"
+                        f"🆔 Room ID: {self.room_id}\n"
                         f"⏱️ Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                        f"📂 Output file: `{os.path.basename(self.output_file)}`"
+                        f"📂 Output file: {os.path.basename(self.output_file)}"
                     )
                     
                     # Use run_async to safely send notification
                     async def send_notification():
                         await self.context.bot.send_message(
                             chat_id=admin_id,
-                            text=notification_message,
-                            parse_mode=ParseMode.MARKDOWN
+                            text=notification_message
                         )
                     
                     # Send notification from main thread
@@ -840,19 +904,39 @@ class TikTokRecorder:
             
         if self.mode == Mode.AUTOMATIC:
             raise TikTokException(TikTokError.COUNTRY_BLACKLISTED)
-            
+    
     def send_telegram_video_sync(self, file_path, recording_duration):
         """Synchronous wrapper for send_to_telegram to be called in a thread"""
         try:
-            # Get event loop for this thread
-            loop = get_or_create_eventloop()
-            # Run the async function
-            loop.run_until_complete(self.send_to_telegram(file_path, recording_duration))
+            # Jalankan fungsi async di telethon_loop yang sudah ada
+            run_in_telethon_loop(self.send_to_telegram(file_path, recording_duration))
         except Exception as e:
             logger.error(f"Error in send_telegram_video_sync: {e}")
+            # Coba lagi dengan pendekatan alternatif jika gagal
+            try:
+                async def send_fallback():
+                    try:
+                        for admin_id in ADMIN_IDS:
+                            await self.context.bot.send_message(
+                                chat_id=admin_id,
+                                text=f"⚠️ Error sending video with Telethon: {e}\n"
+                                     f"Video saved at: {os.path.basename(file_path)}"
+                            )
+                    except Exception as inner_e:
+                        logger.error(f"Error sending fallback message: {inner_e}")
+                
+                # Run fallback in separate asyncio loop (not Telethon loop)
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(send_fallback())
+                loop.close()
+            except Exception as fallback_e:
+                logger.error(f"Fallback notification also failed: {fallback_e}")
     
     async def send_to_telegram(self, file_path, recording_duration):
         """Send recorded file to Telegram users using Telethon"""
+        global telethon_client
+        
         db = init_database()
         
         if self.user not in db["tracked_accounts"]:
@@ -878,7 +962,7 @@ class TikTokRecorder:
             logger.info(f"File too large for Telegram ({file_size_mb:.2f} MB). Compressing...")
             
             # Use smart compression to target size
-            compressed_file = VideoManagement.compress_video(file_path, 1900)  # Target ~1.9GB to be safe
+            compressed_file = VideoManagement.compress_video(file_path, 1900)  # Target ~1.9GB
             
             # Check compressed size
             compressed_size_bytes = os.path.getsize(compressed_file)
@@ -898,14 +982,11 @@ class TikTokRecorder:
         height = video_info["height"]
         duration = video_info["duration"]
         
-        # Prepare Telethon client if not already running
+        # Cek lagi Telethon client
         if not telethon_client.is_connected():
             await telethon_client.connect()
-            if not await telethon_client.is_user_authorized():
-                logger.error("Telethon client not authorized. Please run the auth script first.")
-                # Fallback to bot API
-                await self._send_via_bot_api(send_file, send_size_mb)
-                return
+            
+        is_authorized = await telethon_client.is_user_authorized()
         
         # Send to all admin users
         for admin_id in ADMIN_IDS:
@@ -914,69 +995,100 @@ class TikTokRecorder:
                 status_msg = await self.context.bot.send_message(
                     chat_id=admin_id,
                     text=f"📤 Sending recording of @{self.user}'s livestream ({send_size_mb:.2f} MB)...\n"
-                         f"🕒 This may take a few minutes.",
-                    parse_mode=ParseMode.MARKDOWN
+                         f"🕒 This may take a few minutes."
                 )
                 
-                try:
-                    # Send with Telethon as a video
-                    caption = (
-                        f"🎬 Recording of @{self.user}'s livestream\n\n"
-                        f"🆔 Room ID: {self.room_id}\n"
-                        f"⏱️ Duration: {duration_str}\n"
-                        f"📦 Size: {send_size_mb:.2f} MB\n"
-                        f"🗓️ Recorded on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                        f"{' (compressed)' if compressed_file else ''}"
-                    )
-                    
-                    # Use attributes to ensure it's sent as a video
-                    attributes = [
-                        DocumentAttributeVideo(
-                            duration=int(duration),
-                            w=width,
-                            h=height,
+                if is_authorized:
+                    try:
+                        # Send with Telethon as a video
+                        caption = (
+                            f"🎬 Recording of @{self.user}'s livestream\n\n"
+                            f"🆔 Room ID: {self.room_id}\n"
+                            f"⏱️ Duration: {duration_str}\n"
+                            f"📦 Size: {send_size_mb:.2f} MB\n"
+                            f"🗓️ Recorded on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                            f"{' (compressed)' if compressed_file else ''}"
+                        )
+                        
+                        # Use attributes to ensure it's sent as a video
+                        attributes = [
+                            DocumentAttributeVideo(
+                                duration=int(duration),
+                                w=width,
+                                h=height,
+                                supports_streaming=True
+                            )
+                        ]
+                        
+                        # Send the video using Telethon
+                        await telethon_client.send_file(
+                            admin_id,
+                            file=send_file,
+                            caption=caption,
+                            attributes=attributes,
                             supports_streaming=True
                         )
-                    ]
-                    
-                    # Send the video using Telethon
-                    await telethon_client.send_file(
-                        admin_id,
-                        file=send_file,
-                        caption=caption,
-                        attributes=attributes,
-                        supports_streaming=True
-                    )
-                    
-                    # Update status
+                        
+                        # Update status
+                        await self.context.bot.edit_message_text(
+                            text=f"✅ Recording of @{self.user}'s livestream sent successfully!",
+                            chat_id=admin_id,
+                            message_id=status_msg.message_id
+                        )
+                        
+                    except Exception as e:
+                        logger.error(f"Error sending with Telethon: {e}")
+                        
+                        # Fallback to bot API jika Telethon gagal
+                        await self.context.bot.edit_message_text(
+                            text=f"⚠️ Error with Telethon: {str(e)}. Trying alternative method...",
+                            chat_id=admin_id,
+                            message_id=status_msg.message_id
+                        )
+                        
+                        # Fallback to bot API untuk file kecil
+                        if send_size_mb <= 50:
+                            with open(send_file, 'rb') as video_file:
+                                await self.context.bot.send_video(
+                                    chat_id=admin_id,
+                                    video=video_file,
+                                    caption=caption,
+                                    supports_streaming=True
+                                )
+                        else:
+                            await self.context.bot.send_message(
+                                chat_id=admin_id,
+                                text=f"❌ File too large for Bot API. Video saved at: {os.path.basename(send_file)}"
+                            )
+                else:
+                    # Telethon not authorized, use Bot API
                     await self.context.bot.edit_message_text(
-                        text=f"✅ Recording of @{self.user}'s livestream sent successfully!",
-                        chat_id=admin_id,
-                        message_id=status_msg.message_id,
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-                    
-                except Exception as e:
-                    logger.error(f"Error sending with Telethon: {e}")
-                    
-                    # Fallback to bot API if Telethon fails
-                    await self.context.bot.edit_message_text(
-                        text=f"⚠️ Error with automatic video sending. Trying alternative method...",
+                        text=f"⚠️ Telethon not authorized. Using Bot API instead.",
                         chat_id=admin_id,
                         message_id=status_msg.message_id
                     )
                     
-                    # Fallback to bot API (will send as file not video)
-                    await self._send_via_bot_api(send_file, send_size_mb, admin_id)
-                
+                    if send_size_mb <= 50:
+                        with open(send_file, 'rb') as video_file:
+                            await self.context.bot.send_video(
+                                chat_id=admin_id,
+                                video=video_file,
+                                caption=caption,
+                                supports_streaming=True
+                            )
+                    else:
+                        await self.context.bot.send_message(
+                            chat_id=admin_id,
+                            text=f"❌ File too large for Bot API. Video saved at: {os.path.basename(send_file)}"
+                        )
+                        
             except Exception as e:
                 logger.error(f"Error sending to admin {admin_id}: {e}")
                 
                 try:
                     await self.context.bot.send_message(
                         chat_id=admin_id,
-                        text=f"❌ Error sending the recording: {str(e)}",
-                        parse_mode=ParseMode.MARKDOWN
+                        text=f"❌ Error sending the recording: {str(e)}"
                     )
                 except:
                     pass
@@ -987,7 +1099,7 @@ class TikTokRecorder:
                 os.remove(compressed_file)
             except Exception as e:
                 logger.error(f"Error removing compressed file: {e}")
-    
+
     async def _send_via_bot_api(self, file_path, file_size_mb, admin_id=None):
         """Fallback method to send using Bot API"""
         if admin_id is None:
@@ -995,40 +1107,76 @@ class TikTokRecorder:
             admin_ids = ADMIN_IDS
         else:
             admin_ids = [admin_id]
-            
+                
         # Bot API limit is 50MB
         if file_size_mb > 50:
             for admin_id in admin_ids:
                 await self.context.bot.send_message(
                     chat_id=admin_id,
                     text=f"⚠️ File is too large for direct sending ({file_size_mb:.2f} MB). "
-                         f"The recording is saved locally at: `{file_path}`",
-                    parse_mode=ParseMode.MARKDOWN
+                         f"The recording is saved locally at: {os.path.basename(file_path)}"
                 )
             return
-            
-        # Send as video with Bot API
-        for admin_id in admin_ids:
-            try:
-                with open(file_path, 'rb') as video_file:
-                    await self.context.bot.send_video(
+                
+        # Send as document with Bot API if larger than 10MB (more reliable than video for large files)
+        if file_size_mb > 10:
+            for admin_id in admin_ids:
+                try:
+                    # Send as document instead of video for larger files
+                    with open(file_path, 'rb') as video_file:
+                        await self.context.bot.send_document(
+                            chat_id=admin_id,
+                            document=video_file,
+                            caption=(
+                                f"🎬 Recording of @{self.user}'s livestream\n\n"
+                                f"Room ID: {self.room_id}\n"
+                                f"Size: {file_size_mb:.2f} MB\n"
+                                f"Recorded on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                            )
+                        )
+                except Exception as e:
+                    logger.error(f"Error sending via Bot API as document: {e}")
+                    await self.context.bot.send_message(
                         chat_id=admin_id,
-                        video=video_file,
-                        caption=(
-                            f"🎬 Recording of @{self.user}'s livestream\n\n"
-                            f"🆔 Room ID: {self.room_id}\n"
-                            f"📦 Size: {file_size_mb:.2f} MB\n"
-                            f"🗓️ Recorded on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                        ),
-                        supports_streaming=True
+                        text=f"❌ Could not send file. Recording is saved at: {os.path.basename(file_path)}"
                     )
-            except Exception as e:
-                logger.error(f"Error sending via Bot API: {e}")
-                await self.context.bot.send_message(
-                    chat_id=admin_id,
-                    text=f"❌ Could not send as video. File is saved at: `{file_path}`",
-                    parse_mode=ParseMode.MARKDOWN
-                )
+        else:
+            # Send as video for smaller files
+            for admin_id in admin_ids:
+                try:
+                    with open(file_path, 'rb') as video_file:
+                        await self.context.bot.send_video(
+                            chat_id=admin_id,
+                            video=video_file,
+                            caption=(
+                                f"🎬 Recording of @{self.user}'s livestream\n\n"
+                                f"Room ID: {self.room_id}\n"
+                                f"Size: {file_size_mb:.2f} MB\n"
+                                f"Recorded on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                            ),
+                            supports_streaming=True
+                        )
+                except Exception as e:
+                    logger.error(f"Error sending via Bot API as video: {e}")
+                    try:
+                        # Try as document if video fails
+                        with open(file_path, 'rb') as video_file:
+                            await self.context.bot.send_document(
+                                chat_id=admin_id,
+                                document=video_file,
+                                caption=(
+                                    f"🎬 Recording of @{self.user}'s livestream\n\n"
+                                    f"Room ID: {self.room_id}\n"
+                                    f"Size: {file_size_mb:.2f} MB\n"
+                                    f"Recorded on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                                )
+                            )
+                    except Exception as e2:
+                        logger.error(f"Error sending via Bot API as document: {e2}")
+                        await self.context.bot.send_message(
+                            chat_id=admin_id,
+                            text=f"❌ Could not send file. Recording is saved at: {os.path.basename(file_path)}"
+                        )
 
 # Bot Helper Functions
 def ensure_user(db, user_id):
@@ -1199,7 +1347,7 @@ async def list_accounts(update: Update, context: CallbackContext):
         room_id = account_info.get("room_id", "N/A")
         
         account_list += f"@{username} - {is_live} {is_recording}\n"
-        account_list += f"  └ Room ID: `{room_id}`\n"
+        account_list += f"  └ Room ID: {room_id}\n"
     
     account_list += f"\nTotal: {len(user['tracked_accounts'])} accounts"
     
@@ -1293,15 +1441,13 @@ async def check_account(update: Update, context: CallbackContext, username: str)
             await status_msg.edit_text(
                 f"🔴 @{username} is currently LIVE!\n"
                 f"📹 Already recording this livestream.\n"
-                f"🆔 Room ID: `{room_id}`",
-                parse_mode=ParseMode.MARKDOWN
+                f"🆔 Room ID: {room_id}"
             )
         else:
             await status_msg.edit_text(
                 f"🔴 @{username} is currently LIVE!\n"
                 f"📹 Starting to record this livestream...\n"
-                f"🆔 Room ID: `{room_id}`",
-                parse_mode=ParseMode.MARKDOWN
+                f"🆔 Room ID: {room_id}"
             )
             
             # Start the recording
@@ -1309,9 +1455,8 @@ async def check_account(update: Update, context: CallbackContext, username: str)
     else:
         await status_msg.edit_text(
             f"⚫ @{username} is not currently live.\n"
-            f"🆔 Room ID: `{room_id}`\n"
-            f"⏱️ Last checked: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            parse_mode=ParseMode.MARKDOWN
+            f"🆔 Room ID: {room_id}\n"
+            f"⏱️ Last checked: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
     
     return status_msg
@@ -1364,7 +1509,8 @@ async def check_all_accounts(update: Update, context: CallbackContext):
         if is_live:
             live_count += 1
             account_info["last_live"] = datetime.now().isoformat()
-            results += f"🔴 @{username} is LIVE! (Room ID: `{room_id}`)\n"
+            # Hindari pake backtick di message biar gak error markdown parsing
+            results += f"🔴 @{username} is LIVE! (Room ID: {room_id})\n"
             
             # Check if already recording
             if account_info.get("is_recording", False):
@@ -1375,7 +1521,8 @@ async def check_all_accounts(update: Update, context: CallbackContext):
                 # Start the recording
                 await start_recording_for_account(username, context)
         else:
-            results += f"⚫ @{username} is offline. (Room ID: `{room_id}`)\n"
+            # Hindari pake backtick di message
+            results += f"⚫ @{username} is offline. (Room ID: {room_id})\n"
     
     save_database(db)
     
@@ -1386,10 +1533,9 @@ async def check_all_accounts(update: Update, context: CallbackContext):
     keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="check_all")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Update status message
+    # Update status message - JANGAN pake ParseMode.MARKDOWN di sini
     await status_msg.edit_text(
         f"📊 Status of your tracked accounts:\n\n{results}\n{live_status}",
-        parse_mode=ParseMode.MARKDOWN,
         reply_markup=reply_markup
     )
 
@@ -1439,9 +1585,9 @@ async def show_active_recordings(update: Update, context: CallbackContext):
                 elapsed_str = "N/A"
             
             message += f"{i}. @{recording['username']}\n"
-            message += f"   🆔 Room ID: `{recording['room_id']}`\n"
+            message += f"   🆔 Room ID: {recording['room_id']}\n"
             message += f"   ⏱️ Recording for: {elapsed_str}\n"
-            message += f"   📂 File: `{os.path.basename(recording['file'])}`\n\n"
+            message += f"   📂 File: {os.path.basename(recording['file'])}\n\n"
     
     # Create inline keyboard
     keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="active_recordings")]]
@@ -1452,8 +1598,8 @@ async def show_active_recordings(update: Update, context: CallbackContext):
     else:
         await update.callback_query.edit_message_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
 
-async def show_recordings_list(update: Update, context: CallbackContext):
-    """Show list of completed recordings"""
+async def show_recordings_list(update: Update, context: CallbackContext, page: int = 0):
+    """Show list of completed recordings with pagination"""
     # Directly access user ID without depending on admin_only decorator
     user_id = str(update.effective_user.id if update.effective_user else update.callback_query.from_user.id)
     
@@ -1476,13 +1622,26 @@ async def show_recordings_list(update: Update, context: CallbackContext):
         # Sort by end time (newest first)
         finished_recordings.sort(key=lambda x: x.get("end_time", ""), reverse=True)
         
-        # Limit to 10 most recent recordings
-        recent_recordings = finished_recordings[:10]
+        # Calculate total pages
+        recordings_per_page = 10
+        total_recordings = len(finished_recordings)
+        total_pages = (total_recordings + recordings_per_page - 1) // recordings_per_page
+        
+        # Ensure page is within valid range
+        if page < 0:
+            page = 0
+        elif page >= total_pages:
+            page = total_pages - 1
+        
+        # Get recordings for the current page
+        start_idx = page * recordings_per_page
+        end_idx = min(start_idx + recordings_per_page, total_recordings)
+        current_page_recordings = finished_recordings[start_idx:end_idx]
         
         # Create message with finished recordings
-        message = "📋 *Recent Recordings*:\n\n"
+        message = f"📋 *Recent Recordings* (Page {page+1}/{total_pages}):\n\n"
         
-        for i, recording in enumerate(recent_recordings, 1):
+        for i, recording in enumerate(current_page_recordings, start_idx + 1):
             username = recording.get("username", "Unknown")
             room_id = recording.get("room_id", "N/A")
             duration = recording.get("duration_seconds", 0)
@@ -1505,21 +1664,38 @@ async def show_recordings_list(update: Update, context: CallbackContext):
                     pass
             
             message += f"{i}. @{username}\n"
-            message += f"   🆔 Room ID: `{room_id}`\n"
+            message += f"   🆔 Room ID: {room_id}\n"
             message += f"   ⏱️ Duration: {duration_str}\n"
-            message += f"   📂 File: `{file_name}`\n"
+            message += f"   📂 File: {file_name}\n"
             message += f"   📦 Size: {size_mb:.2f} MB\n"
             message += f"   🗓️ Recorded: {date_str}\n\n"
         
         # Create inline keyboard with buttons for each recording
         keyboard = []
-        for i, recording in enumerate(recent_recordings, 1):
+        for i, recording in enumerate(current_page_recordings, start_idx + 1):
             username = recording.get("username", "Unknown")
             keyboard.append([
                 InlineKeyboardButton(f"Send #{i}: @{username}", callback_data=f"send_recording_{i-1}")
             ])
         
-        keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="recordings_list")])
+        # Add pagination buttons if needed
+        pagination_buttons = []
+        if page > 0:
+            pagination_buttons.append(
+                InlineKeyboardButton("« Previous", callback_data=f"recordings_page_{page-1}")
+            )
+        
+        pagination_buttons.append(
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"recordings_page_{page}")
+        )
+        
+        if page < total_pages - 1:
+            pagination_buttons.append(
+                InlineKeyboardButton("Next »", callback_data=f"recordings_page_{page+1}")
+            )
+        
+        keyboard.append(pagination_buttons)
+        keyboard.append([InlineKeyboardButton("🔙 Back to Main", callback_data="back_to_main")])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -1530,6 +1706,8 @@ async def show_recordings_list(update: Update, context: CallbackContext):
 
 async def send_recording(update: Update, context: CallbackContext, index: int):
     """Send a specific recording to the user via Telethon"""
+    global telethon_client
+    
     # Directly access user ID without depending on admin_only decorator
     query = update.callback_query
     user_id = query.from_user.id
@@ -1628,7 +1806,7 @@ async def send_recording(update: Update, context: CallbackContext, index: int):
             f"{' (compressed)' if size_bytes > max_size else ''}"
         )
         
-        # Make sure Telethon client is connected
+        # Cek koneksi Telethon client
         if not telethon_client.is_connected():
             await telethon_client.connect()
             
@@ -1650,8 +1828,7 @@ async def send_recording(update: Update, context: CallbackContext, index: int):
             else:
                 await status_msg.edit_text(
                     f"❌ File is too large for Bot API ({send_size_mb:.2f} MB) and Telethon is not authorized.\n"
-                    f"File is available at: `{send_file}`",
-                    parse_mode=ParseMode.MARKDOWN
+                    f"File is available at: {os.path.basename(send_file)}"
                 )
         else:
             # Set up video attributes
@@ -1664,14 +1841,18 @@ async def send_recording(update: Update, context: CallbackContext, index: int):
                 )
             ]
             
-            # Send via Telethon
-            await telethon_client.send_file(
-                user_id,
-                file=send_file,
-                caption=caption,
-                attributes=attributes,
-                supports_streaming=True
-            )
+            # Define function to send via Telethon in its proper loop
+            async def send_via_telethon():
+                await telethon_client.send_file(
+                    user_id,
+                    file=send_file,
+                    caption=caption,
+                    attributes=attributes,
+                    supports_streaming=True
+                )
+            
+            # Run in Telethon loop
+            await run_in_telethon_loop(send_via_telethon())
             
             # Update status message
             await status_msg.edit_text("✅ Recording sent successfully as video!")
@@ -1699,15 +1880,13 @@ async def send_recording(update: Update, context: CallbackContext, index: int):
             else:
                 await status_msg.edit_text(
                     f"❌ Error sending the recording: {str(e)}\n"
-                    f"The file is available at: `{send_file}`",
-                    parse_mode=ParseMode.MARKDOWN
+                    f"The file is available at: {os.path.basename(send_file)}"
                 )
         except Exception as inner_e:
             logger.error(f"Error in fallback sending: {inner_e}")
             await status_msg.edit_text(
                 f"❌ Error sending the recording: {str(e)}\n"
-                f"The file is available at: `{send_file}`",
-                parse_mode=ParseMode.MARKDOWN
+                f"The file is available at: {os.path.basename(send_file)}"
             )
 
 async def start_recording_for_account(username: str, context: CallbackContext):
@@ -1764,10 +1943,9 @@ async def start_recording_for_account(username: str, context: CallbackContext):
             chat_id=admin_id,
             text=(
                 f"🔴 @{username} is now LIVE!\n"
-                f"🆔 Room ID: `{room_id}`\n"
+                f"🆔 Room ID: {room_id}\n"
                 f"📹 Recording started automatically."
-            ),
-            parse_mode=ParseMode.MARKDOWN
+            )
         )
     
     # Start recording in a separate thread
@@ -1823,8 +2001,7 @@ def run_recording_thread(username, room_id, context):
                         async def send_error_notification():
                             await context.bot.send_message(
                                 chat_id=admin_id,
-                                text=f"❌ Error recording @{username}'s livestream: {str(e)}",
-                                parse_mode=ParseMode.MARKDOWN
+                                text=f"❌ Error recording @{username}'s livestream: {str(e)}"
                             )
                         
                         # Get or create event loop for this thread
@@ -1852,11 +2029,6 @@ async def check_tracked_accounts_job(context: CallbackContext):
     
     for username, account_info in list(db["tracked_accounts"].items()):
         try:
-            # Skip accounts that are already being recorded
-            if account_info.get("is_recording", False):
-                logger.info(f"Skipping {username} - already recording")
-                continue
-            
             logger.info(f"Checking if {username} is live...")
             
             # Get room ID
@@ -1873,25 +2045,46 @@ async def check_tracked_accounts_job(context: CallbackContext):
             
             # Check if live
             is_live = api.is_room_alive(room_id)
+            was_live = account_info.get("is_live", False)
+            was_recording = account_info.get("is_recording", False)
             
             # Update live status
-            was_live = account_info.get("is_live", False)
             account_info["is_live"] = is_live
             
             if is_live:
                 account_info["last_live"] = datetime.now().isoformat()
                 logger.info(f"{username} is LIVE!")
                 
-                # Only start recording if not already recording and just went live
-                if not was_live:
-                    await start_recording_for_account(username, context)
+                # If they're live now but not recording
+                if not was_recording:
+                    # Check if this is a new stream (was not live before or the previous stream ended)
+                    # We consider it a new stream if:
+                    # 1. They weren't live before (was_live == False)
+                    # 2. OR They were live before but the recording stopped for some reason
+                    if not was_live or (was_live and not was_recording):
+                        logger.info(f"Starting new recording for {username}")
+                        await start_recording_for_account(username, context)
             else:
+                # If they're not live now but marked as recording, update status
+                if was_recording:
+                    logger.info(f"{username} is no longer live but still marked as recording. Fixing status.")
+                    account_info["is_recording"] = False
+                    save_database(db)
+                
                 logger.info(f"{username} is not live.")
             
             save_database(db)
             
         except Exception as e:
             logger.error(f"Error checking {username}: {e}")
+            
+            # Try to fix recording status if there was an error
+            if "is_recording" in account_info and account_info["is_recording"]:
+                # Check if the recording process is actually running
+                if not is_recording_active(username):
+                    logger.info(f"Recording status mismatch for {username}. Fixing.")
+                    account_info["is_recording"] = False
+                    save_database(db)
 
 # Telegram Bot Command Handlers
 @admin_only
@@ -2052,7 +2245,12 @@ async def callback_handler(update: Update, context: CallbackContext):
         await show_active_recordings(update, context)
     
     elif query.data == "recordings_list":
-        await show_recordings_list(update, context)
+        await show_recordings_list(update, context, 0)  # Start at first page
+    
+    # New pagination handler for recordings list
+    elif query.data.startswith("recordings_page_"):
+        page = int(query.data.replace("recordings_page_", ""))
+        await show_recordings_list(update, context, page)
     
     elif query.data == "back_to_main":
         # Go back to main menu
@@ -2207,27 +2405,6 @@ async def text_handler(update: Update, context: CallbackContext):
         logger.error(f"Error in text handler: {e}")
         await update.message.reply_text(f"❌ Error processing command: {str(e)}")
 
-# Function to start Telethon client in a separate thread
-# Function to start Telethon client in a separate thread
-def start_telethon_client():
-    try:
-        # Create a new event loop for this thread
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        # Define an async init function
-        async def init_telethon():
-            await telethon_client.connect()
-            if not await telethon_client.is_user_authorized():
-                logger.warning("Telethon client not authorized. Using Bot API as fallback.")
-            else:
-                logger.info("Telethon client authorized and ready.")
-        
-        # Run the async init function in the event loop
-        loop.run_until_complete(init_telethon())
-    except Exception as e:
-        logger.error(f"Error starting Telethon client: {e}")
-
 async def setup_job_queue(application):
     """Set up job queue for checking accounts"""
     job_queue = application.job_queue
@@ -2258,7 +2435,16 @@ async def setup_job_queue(application):
 
 def main():
     """Start the bot"""
+    global telethon_runner
+    
     try:
+        # Initialize Telethon first
+        initialize_telethon()
+        
+        # Start Telethon event loop di background
+        telethon_runner = TelethonLoopRunner()
+        telethon_runner.start()
+        
         # Create the application and pass it your bot's token
         application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         
@@ -2279,13 +2465,16 @@ def main():
         # Register text message handler
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
         
-        # Set up job queue and initialize Telethon
+        # Set up job queue
         application.job_queue.run_once(lambda context: asyncio.create_task(setup_job_queue(application)), 0)
         
         logger.info("Starting bot...")
         application.run_polling(allowed_updates=Update.ALL_TYPES)
     except Exception as e:
         logger.error(f"Critical error in main function: {e}")
+        # Stop Telethon event loop
+        if telethon_runner:
+            telethon_runner.stop()
         # Try to restart the bot after a delay
         logger.info("Restarting bot in 10 seconds...")
         time.sleep(10)
@@ -2306,11 +2495,6 @@ if __name__ == "__main__":
         # If no event loop exists, create a new one
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-    
-    # Start Telethon client in a separate thread to avoid conflicts with bot
-    telethon_thread = threading.Thread(target=start_telethon_client)
-    telethon_thread.daemon = True
-    telethon_thread.start()
     
     # Run the bot
     main()
