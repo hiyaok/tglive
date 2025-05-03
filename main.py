@@ -70,6 +70,9 @@ COOKIES_FILE = Path("cookies.json")
 # Initialize Telethon client
 telethon_client = TelegramClient('tiktok_recorder_session', API_ID, API_HASH)
 
+# Global event loop for main thread
+main_event_loop = asyncio.get_event_loop()
+
 # Enum Mode
 class Mode:
     MANUAL = 0
@@ -159,6 +162,16 @@ def format_duration(seconds):
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
+
+# Helper function to run async tasks in threads
+def run_async_in_thread(coro):
+    """Run an async coroutine in a thread-specific event loop"""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 # HTTP Client
 class HttpClient:
@@ -685,8 +698,16 @@ class TikTokRecorder:
         
         # Send notification to admin users
         if self.context:
-            for admin_id in ADMIN_IDS:
-                asyncio.run_coroutine_threadsafe(self._send_recording_started_notification(admin_id), asyncio.get_event_loop())
+            async def send_notifications():
+                for admin_id in ADMIN_IDS:
+                    await self._send_recording_started_notification(admin_id)
+            
+            # Run async notification in thread-safe way
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(send_notifications())
+            else:
+                asyncio.run(send_notifications())
         
         start_recording_time = datetime.now()
         recording_duration = 0
@@ -778,7 +799,14 @@ class TikTokRecorder:
         
         # Send to Telegram if enabled
         if self.use_telegram and self.context:
-            asyncio.run_coroutine_threadsafe(self.send_to_telegram(output_mp4, recording_duration), asyncio.get_event_loop())
+            def send_telegram_video():
+                # Run in thread-specific event loop
+                run_async_in_thread(self.send_to_telegram(output_mp4, recording_duration))
+                
+            # Start a thread for telegram sending to avoid blocking
+            telegram_thread = threading.Thread(target=send_telegram_video)
+            telegram_thread.daemon = True
+            telegram_thread.start()
             
         return output_mp4
             
@@ -1133,15 +1161,21 @@ async def remove_account(update: Update, context: CallbackContext):
 @admin_only
 async def list_accounts(update: Update, context: CallbackContext):
     """List tracked TikTok accounts"""
-    user_id = str(update.effective_user.id)
+    user_id = str(update.effective_user.id if update.effective_user else update.callback_query.from_user.id)
     db = init_database()
     user = ensure_user(db, user_id)
     
     if not user["tracked_accounts"]:
-        await update.message.reply_text(
-            "📋 You are not tracking any TikTok accounts yet.\n\n"
-            "Use /add username to start tracking an account."
-        )
+        if hasattr(update, 'message') and update.message:
+            await update.message.reply_text(
+                "📋 You are not tracking any TikTok accounts yet.\n\n"
+                "Use /add username to start tracking an account."
+            )
+        else:
+            await update.callback_query.edit_message_text(
+                "📋 You are not tracking any TikTok accounts yet.\n\n"
+                "Use /add username to start tracking an account."
+            )
         return
     
     # Create a list of tracked accounts with their status
@@ -1181,12 +1215,15 @@ async def list_accounts(update: Update, context: CallbackContext):
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text(account_list, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+    if hasattr(update, 'message') and update.message:
+        await update.message.reply_text(account_list, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+    else:
+        await update.callback_query.edit_message_text(account_list, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
 
 @admin_only
 async def check_account(update: Update, context: CallbackContext, username: str):
     """Check if a TikTok account is currently live"""
-    user_id = str(update.effective_user.id)
+    user_id = str(update.effective_user.id if update.effective_user else update.callback_query.from_user.id)
     db = init_database()
     user = ensure_user(db, user_id)
     
@@ -1262,7 +1299,7 @@ async def check_account(update: Update, context: CallbackContext, username: str)
 @admin_only
 async def check_all_accounts(update: Update, context: CallbackContext):
     """Check all tracked accounts if they are live"""
-    user_id = str(update.effective_user.id)
+    user_id = str(update.effective_user.id if update.effective_user else update.callback_query.from_user.id)
     db = init_database()
     user = ensure_user(db, user_id)
     
@@ -1270,13 +1307,14 @@ async def check_all_accounts(update: Update, context: CallbackContext):
         if hasattr(update, 'message') and update.message:
             await update.message.reply_text("⚠️ You are not tracking any TikTok accounts yet.")
         else:
-            await update.callback_query.message.reply_text("⚠️ You are not tracking any TikTok accounts yet.")
+            await update.callback_query.edit_message_text("⚠️ You are not tracking any TikTok accounts yet.")
         return
     
+    # Send or edit status message
     if hasattr(update, 'message') and update.message:
         status_msg = await update.message.reply_text("🔍 Checking if any of your tracked accounts are live...")
     else:
-        status_msg = await update.callback_query.message.reply_text("🔍 Checking if any of your tracked accounts are live...")
+        status_msg = await update.callback_query.edit_message_text("🔍 Checking if any of your tracked accounts are live...")
     
     # Initialize API
     cookies = init_cookies()
@@ -1323,9 +1361,16 @@ async def check_all_accounts(update: Update, context: CallbackContext):
     
     # Update the status message
     live_status = f"🎉 {live_count} account(s) are currently live!" if live_count > 0 else "😴 None of your tracked accounts are currently live."
+
+    # Add refresh button
+    keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="check_all")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Update status message
     await status_msg.edit_text(
         f"📊 Status of your tracked accounts:\n\n{results}\n{live_status}",
-        parse_mode=ParseMode.MARKDOWN
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup
     )
 
 @admin_only
@@ -1343,43 +1388,39 @@ async def show_active_recordings(update: Update, context: CallbackContext):
                 "file": account_info.get("current_recording_file", "N/A")
             })
     
-    if not active_recordings:
-        if hasattr(update, 'message') and update.message:
-            await update.message.reply_text("📹 No active recordings at the moment.")
-        else:
-            await update.callback_query.message.reply_text("📹 No active recordings at the moment.")
-        return
+    message = "📹 No active recordings at the moment."
     
-    # Create message with active recordings
-    active_list = "📹 *Active Recordings*:\n\n"
-    
-    for i, recording in enumerate(active_recordings, 1):
-        start_time = recording["start_time"]
-        if start_time != "N/A":
-            try:
-                start_datetime = datetime.fromisoformat(start_time)
-                elapsed = datetime.now() - start_datetime
-                hours, remainder = divmod(elapsed.total_seconds(), 3600)
-                minutes, seconds = divmod(remainder, 60)
-                elapsed_str = f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
-            except:
-                elapsed_str = "N/A"
-        else:
-            elapsed_str = "N/A"
+    if active_recordings:
+        # Create message with active recordings
+        message = "📹 *Active Recordings*:\n\n"
         
-        active_list += f"{i}. @{recording['username']}\n"
-        active_list += f"   🆔 Room ID: `{recording['room_id']}`\n"
-        active_list += f"   ⏱️ Recording for: {elapsed_str}\n"
-        active_list += f"   📂 File: `{os.path.basename(recording['file'])}`\n\n"
+        for i, recording in enumerate(active_recordings, 1):
+            start_time = recording["start_time"]
+            if start_time != "N/A":
+                try:
+                    start_datetime = datetime.fromisoformat(start_time)
+                    elapsed = datetime.now() - start_datetime
+                    hours, remainder = divmod(elapsed.total_seconds(), 3600)
+                    minutes, seconds = divmod(remainder, 60)
+                    elapsed_str = f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
+                except:
+                    elapsed_str = "N/A"
+            else:
+                elapsed_str = "N/A"
+            
+            message += f"{i}. @{recording['username']}\n"
+            message += f"   🆔 Room ID: `{recording['room_id']}`\n"
+            message += f"   ⏱️ Recording for: {elapsed_str}\n"
+            message += f"   📂 File: `{os.path.basename(recording['file'])}`\n\n"
     
     # Create inline keyboard
     keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="active_recordings")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     if hasattr(update, 'message') and update.message:
-        await update.message.reply_text(active_list, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+        await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
     else:
-        await update.callback_query.message.edit_text(active_list, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+        await update.callback_query.edit_message_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
 
 @admin_only
 async def show_recordings_list(update: Update, context: CallbackContext):
@@ -1388,66 +1429,71 @@ async def show_recordings_list(update: Update, context: CallbackContext):
     
     finished_recordings = db.get("finished_recordings", [])
     
-    if not finished_recordings:
+    message = "📋 No completed recordings yet."
+    
+    if finished_recordings:
+        # Sort by end time (newest first)
+        finished_recordings.sort(key=lambda x: x.get("end_time", ""), reverse=True)
+        
+        # Limit to 10 most recent recordings
+        recent_recordings = finished_recordings[:10]
+        
+        # Create message with finished recordings
+        message = "📋 *Recent Recordings*:\n\n"
+        
+        for i, recording in enumerate(recent_recordings, 1):
+            username = recording.get("username", "Unknown")
+            room_id = recording.get("room_id", "N/A")
+            duration = recording.get("duration_seconds", 0)
+            file_path = recording.get("file_path", "")
+            file_name = os.path.basename(file_path)
+            size_bytes = recording.get("size_bytes", 0)
+            size_mb = size_bytes / (1024 * 1024) if size_bytes else 0
+            
+            # Format duration
+            duration_str = format_duration(duration)
+            
+            # Format date
+            end_time = recording.get("end_time", "")
+            date_str = "N/A"
+            if end_time:
+                try:
+                    end_datetime = datetime.fromisoformat(end_time)
+                    date_str = end_datetime.strftime("%Y-%m-%d %H:%M:%S")
+                except:
+                    pass
+            
+            message += f"{i}. @{username}\n"
+            message += f"   🆔 Room ID: `{room_id}`\n"
+            message += f"   ⏱️ Duration: {duration_str}\n"
+            message += f"   📂 File: `{file_name}`\n"
+            message += f"   📦 Size: {size_mb:.2f} MB\n"
+            message += f"   🗓️ Recorded: {date_str}\n\n"
+        
+        # Create inline keyboard with buttons for each recording
+        keyboard = []
+        for i, recording in enumerate(recent_recordings, 1):
+            username = recording.get("username", "Unknown")
+            keyboard.append([
+                InlineKeyboardButton(f"Send #{i}: @{username}", callback_data=f"send_recording_{i-1}")
+            ])
+        
+        keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="recordings_list")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
         if hasattr(update, 'message') and update.message:
-            await update.message.reply_text("📋 No completed recordings yet.")
+            await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
         else:
-            await update.callback_query.message.reply_text("📋 No completed recordings yet.")
-        return
-    
-    # Sort by end time (newest first)
-    finished_recordings.sort(key=lambda x: x.get("end_time", ""), reverse=True)
-    
-    # Limit to 10 most recent recordings
-    recent_recordings = finished_recordings[:10]
-    
-    # Create message with finished recordings
-    recordings_list = "📋 *Recent Recordings*:\n\n"
-    
-    for i, recording in enumerate(recent_recordings, 1):
-        username = recording.get("username", "Unknown")
-        room_id = recording.get("room_id", "N/A")
-        duration = recording.get("duration_seconds", 0)
-        file_path = recording.get("file_path", "")
-        file_name = os.path.basename(file_path)
-        size_bytes = recording.get("size_bytes", 0)
-        size_mb = size_bytes / (1024 * 1024) if size_bytes else 0
-        
-        # Format duration
-        duration_str = format_duration(duration)
-        
-        # Format date
-        end_time = recording.get("end_time", "")
-        date_str = "N/A"
-        if end_time:
-            try:
-                end_datetime = datetime.fromisoformat(end_time)
-                date_str = end_datetime.strftime("%Y-%m-%d %H:%M:%S")
-            except:
-                pass
-        
-        recordings_list += f"{i}. @{username}\n"
-        recordings_list += f"   🆔 Room ID: `{room_id}`\n"
-        recordings_list += f"   ⏱️ Duration: {duration_str}\n"
-        recordings_list += f"   📂 File: `{file_name}`\n"
-        recordings_list += f"   📦 Size: {size_mb:.2f} MB\n"
-        recordings_list += f"   🗓️ Recorded: {date_str}\n\n"
-    
-    # Create inline keyboard with buttons for each recording
-    keyboard = []
-    for i, recording in enumerate(recent_recordings, 1):
-        username = recording.get("username", "Unknown")
-        keyboard.append([
-            InlineKeyboardButton(f"Send #{i}: @{username}", callback_data=f"send_recording_{i-1}")
-        ])
-    
-    keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="recordings_list")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    if hasattr(update, 'message') and update.message:
-        await update.message.reply_text(recordings_list, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+            await update.callback_query.edit_message_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
     else:
-        await update.callback_query.message.edit_text(recordings_list, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+        # No recordings, just add a refresh button
+        keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="recordings_list")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        if hasattr(update, 'message') and update.message:
+            await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+        else:
+            await update.callback_query.edit_message_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
 
 @admin_only
 async def send_recording(update: Update, context: CallbackContext, index: int):
@@ -1732,19 +1778,20 @@ def run_recording_thread(username, room_id, context):
                 account_info["last_error"] = str(e)
                 save_database(db)
                 
-                # Use the asyncio event loop to send notifications
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+                # Create a new async function to send notifications
+                async def send_error_notifications():
+                    for admin_id in ADMIN_IDS:
+                        try:
+                            await context.bot.send_message(
+                                chat_id=admin_id,
+                                text=f"❌ Error recording @{username}'s livestream: {str(e)}",
+                                parse_mode=ParseMode.MARKDOWN
+                            )
+                        except Exception as notify_error:
+                            logger.error(f"Error sending notification: {notify_error}")
                 
-                # Notify admin users
-                for admin_id in ADMIN_IDS:
-                    loop.run_until_complete(context.bot.send_message(
-                        chat_id=admin_id,
-                        text=f"❌ Error recording @{username}'s livestream: {str(e)}",
-                        parse_mode=ParseMode.MARKDOWN
-                    ))
-                
-                loop.close()
+                # Run the async function in a thread-specific event loop
+                run_async_in_thread(send_error_notifications())
     
     except Exception as e:
         logger.error(f"Thread error for {username}: {e}")
@@ -1848,34 +1895,43 @@ async def start(update: Update, context: CallbackContext):
 @admin_only
 async def help_command(update: Update, context: CallbackContext):
     """Handle the /help command"""
-    message = update.message or update.callback_query.message
+    message = "📚 *Available Commands:*\n\n" \
+             "📌 /add username - Track a TikTok account\n" \
+             "📋 /list - Show your tracked accounts\n" \
+             "🗑️ /remove username - Stop tracking an account\n" \
+             "⚙️ /settings - Configure bot settings\n" \
+             "🔄 /check - Manually check if tracked accounts are live\n" \
+             "📹 /active - Show active recordings\n" \
+             "📋 /recordings - Show completed recordings list\n" \
+             "❓ /help - Show this help message\n\n" \
+             "The bot automatically checks for livestreams based on your settings interval. " \
+             "When a tracked account goes live, it will notify you and start recording. " \
+             "When the livestream ends, it will send you the recording as a video."
     
-    await message.reply_text(
-        f"📚 *Available Commands:*\n\n"
-        f"📌 /add username - Track a TikTok account\n"
-        f"📋 /list - Show your tracked accounts\n"
-        f"🗑️ /remove username - Stop tracking an account\n"
-        f"⚙️ /settings - Configure bot settings\n"
-        f"🔄 /check - Manually check if tracked accounts are live\n"
-        f"📹 /active - Show active recordings\n"
-        f"📋 /recordings - Show completed recordings list\n"
-        f"❓ /help - Show this help message\n\n"
-        f"The bot automatically checks for livestreams based on your settings interval. "
-        f"When a tracked account goes live, it will notify you and start recording. "
-        f"When the livestream ends, it will send you the recording as a video.",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    keyboard = [[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="back_to_main")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if hasattr(update, 'message') and update.message:
+        await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+    else:
+        await update.callback_query.edit_message_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
 
 @admin_only
 async def settings_command(update: Update, context: CallbackContext):
     """Handle the /settings command"""
-    message = update.message or update.callback_query.message
     user_id = str(update.effective_user.id if update.effective_user else update.callback_query.from_user.id)
     
     db = init_database()
     user = ensure_user(db, user_id)
     
     settings = user["settings"]
+    
+    message = f"⚙️ *Settings*\n\n" \
+             f"🔔 Notify when account goes live: {'✅ ON' if settings.get('notify_on_live', True) else '❌ OFF'}\n" \
+             f"🎥 Recording quality: {settings.get('record_quality', 'best')}\n" \
+             f"🗜️ Auto-compress large files: {'✅ ON' if settings.get('auto_compress', True) else '❌ OFF'}\n" \
+             f"⏱️ Check interval: {settings.get('check_interval', 5)} minutes\n\n" \
+             f"Select a setting to change:"
     
     keyboard = [
         [InlineKeyboardButton(
@@ -1902,16 +1958,10 @@ async def settings_command(update: Update, context: CallbackContext):
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await message.reply_text(
-        f"⚙️ *Settings*\n\n"
-        f"🔔 Notify when account goes live: {'✅ ON' if settings.get('notify_on_live', True) else '❌ OFF'}\n"
-        f"🎥 Recording quality: {settings.get('record_quality', 'best')}\n"
-        f"🗜️ Auto-compress large files: {'✅ ON' if settings.get('auto_compress', True) else '❌ OFF'}\n"
-        f"⏱️ Check interval: {settings.get('check_interval', 5)} minutes\n\n"
-        f"Select a setting to change:",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=reply_markup
-    )
+    if hasattr(update, 'message') and update.message:
+        await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+    else:
+        await update.callback_query.edit_message_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
 
 @admin_only
 async def active_command(update: Update, context: CallbackContext):
@@ -2078,39 +2128,43 @@ async def callback_handler(update: Update, context: CallbackContext):
 @admin_only
 async def text_handler(update: Update, context: CallbackContext):
     """Handle regular text messages"""
-    text = update.message.text.lower()
-    
-    if text.startswith("add "):
-        username = text.split(" ", 1)[1].strip()
-        context.args = [username]
-        await add_account(update, context)
-    
-    elif text.startswith("remove "):
-        username = text.split(" ", 1)[1].strip()
-        context.args = [username]
-        await remove_account(update, context)
-    
-    elif text.startswith("check "):
-        username = text.split(" ", 1)[1].strip()
-        await check_account(update, context, username)
-    
-    elif text == "list":
-        await list_accounts(update, context)
-    
-    elif text == "check":
-        await check_all_accounts(update, context)
-    
-    elif text == "settings":
-        await settings_command(update, context)
-    
-    elif text == "help":
-        await help_command(update, context)
-    
-    elif text == "active":
-        await active_command(update, context)
-    
-    elif text == "recordings":
-        await recordings_command(update, context)
+    try:
+        text = update.message.text.lower()
+        
+        if text.startswith("add "):
+            username = text.split(" ", 1)[1].strip()
+            context.args = [username]
+            await add_account(update, context)
+        
+        elif text.startswith("remove "):
+            username = text.split(" ", 1)[1].strip()
+            context.args = [username]
+            await remove_account(update, context)
+        
+        elif text.startswith("check "):
+            username = text.split(" ", 1)[1].strip()
+            await check_account(update, context, username)
+        
+        elif text == "list":
+            await list_accounts(update, context)
+        
+        elif text == "check":
+            await check_all_accounts(update, context)
+        
+        elif text == "settings":
+            await settings_command(update, context)
+        
+        elif text == "help":
+            await help_command(update, context)
+        
+        elif text == "active":
+            await active_command(update, context)
+        
+        elif text == "recordings":
+            await recordings_command(update, context)
+    except Exception as e:
+        logger.error(f"Error in text handler: {e}")
+        await update.message.reply_text(f"❌ Error processing command: {str(e)}")
 
 async def setup_job_queue(application):
     """Set up job queue for checking accounts"""
@@ -2121,6 +2175,16 @@ async def setup_job_queue(application):
     
     # Set default check interval to 5 minutes
     check_interval = 5
+    
+    # Check if any admin has a custom interval
+    for admin_id in ADMIN_IDS:
+        admin_id_str = str(admin_id)
+        if admin_id_str in db["users"]:
+            settings = db["users"][admin_id_str].get("settings", {})
+            custom_interval = settings.get("check_interval", None)
+            if custom_interval:
+                check_interval = custom_interval
+                break
     
     # Set up the job
     job_queue.run_repeating(
@@ -2147,36 +2211,58 @@ async def initialize_telethon():
 
 def main():
     """Start the bot"""
-    # Create the application and pass it your bot's token
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    # Register command handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("add", add_account))
-    application.add_handler(CommandHandler("remove", remove_account))
-    application.add_handler(CommandHandler("list", list_accounts))
-    application.add_handler(CommandHandler("check", check_all_accounts))
-    application.add_handler(CommandHandler("settings", settings_command))
-    application.add_handler(CommandHandler("active", active_command))
-    application.add_handler(CommandHandler("recordings", recordings_command))
-    
-    # Register callback query handler
-    application.add_handler(CallbackQueryHandler(callback_handler))
-    
-    # Register text message handler
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    
-    # Set up job queue and initialize Telethon
-    application.job_queue.run_once(lambda context: asyncio.create_task(setup_job_queue(application)), 0)
-    application.job_queue.run_once(lambda context: asyncio.create_task(initialize_telethon()), 0)
-    
-    logger.info("Starting bot...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        # Create the application and pass it your bot's token
+        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        
+        # Register command handlers
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("add", add_account))
+        application.add_handler(CommandHandler("remove", remove_account))
+        application.add_handler(CommandHandler("list", list_accounts))
+        application.add_handler(CommandHandler("check", check_all_accounts))
+        application.add_handler(CommandHandler("settings", settings_command))
+        application.add_handler(CommandHandler("active", active_command))
+        application.add_handler(CommandHandler("recordings", recordings_command))
+        
+        # Register callback query handler
+        application.add_handler(CallbackQueryHandler(callback_handler))
+        
+        # Register text message handler
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+        
+        # Set up job queue and initialize Telethon
+        application.job_queue.run_once(lambda context: asyncio.create_task(setup_job_queue(application)), 0)
+        application.job_queue.run_once(lambda context: asyncio.create_task(initialize_telethon()), 0)
+        
+        logger.info("Starting bot...")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    except Exception as e:
+        logger.error(f"Critical error in main function: {e}")
+        # Try to restart the bot after a delay
+        logger.info("Restarting bot in 10 seconds...")
+        time.sleep(10)
+        main()
 
 if __name__ == "__main__":
-    # Start Telethon client
-    telethon_client.start()
+    # Initialize event loop for main thread
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
+    # Ensure the main event loop is set
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+    except RuntimeError:
+        # If no event loop exists, create a new one
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    # Start Telethon client in a separate thread to avoid conflicts with bot
+    threading.Thread(target=lambda: asyncio.run(telethon_client.start())).start()
     
     # Run the bot
     main()
