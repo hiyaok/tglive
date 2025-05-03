@@ -2522,6 +2522,34 @@ async def setup_job_queue(application):
         name="check_accounts"
     )
 
+async def start_telegram_bot():
+    """Async function to start the bot"""
+    # Create the application and pass it your bot's token
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Register command handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("add", add_account))
+    application.add_handler(CommandHandler("remove", remove_account))
+    application.add_handler(CommandHandler("list", list_accounts))
+    application.add_handler(CommandHandler("check", check_all_accounts))
+    application.add_handler(CommandHandler("settings", settings_command))
+    application.add_handler(CommandHandler("active", active_command))
+    application.add_handler(CommandHandler("recordings", recordings_command))
+    
+    # Register callback query handler
+    application.add_handler(CallbackQueryHandler(callback_handler))
+    
+    # Register text message handler
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    
+    # Check for active recordings on startup (before we start polling)
+    await check_active_recordings_on_startup(application)
+    
+    # Start polling (non-async function that will run until the program ends)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
 def main():
     """Start the bot"""
     global telethon_runner
@@ -2530,35 +2558,19 @@ def main():
         # Initialize Telethon first
         initialize_telethon()
         
-        # Start Telethon event loop di background
+        # Start Telethon event loop in background
         telethon_runner = TelethonLoopRunner()
         telethon_runner.start()
         
-        # Create the application and pass it your bot's token
-        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        # Get event loop
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
         
-        # Register command handlers
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("help", help_command))
-        application.add_handler(CommandHandler("add", add_account))
-        application.add_handler(CommandHandler("remove", remove_account))
-        application.add_handler(CommandHandler("list", list_accounts))
-        application.add_handler(CommandHandler("check", check_all_accounts))
-        application.add_handler(CommandHandler("settings", settings_command))
-        application.add_handler(CommandHandler("active", active_command))
-        application.add_handler(CommandHandler("recordings", recordings_command))
-        
-        # Register callback query handler
-        application.add_handler(CallbackQueryHandler(callback_handler))
-        
-        # Register text message handler
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-        
-        # Set up job queue
-        application.job_queue.run_once(lambda context: asyncio.create_task(setup_job_queue(application)), 0)
-        
+        # Run the bot startup in the event loop
         logger.info("Starting bot...")
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        loop.run_until_complete(start_telegram_bot())
     except Exception as e:
         logger.error(f"Critical error in main function: {e}")
         # Stop Telethon event loop
