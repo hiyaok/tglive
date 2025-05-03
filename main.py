@@ -2522,39 +2522,32 @@ async def setup_job_queue(application):
         name="check_accounts"
     )
 
-def main():
-    """Main function to start everything"""
+def start_telethon_client():
+    """Initialize and start Telethon client in a separate thread"""
     global telethon_client, telethon_loop
     
-    # Set up proper event loop policy for Windows if needed
-    if sys.platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    # Create a dedicated event loop for Telethon
+    telethon_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(telethon_loop)
     
+    # Initialize Telethon client
+    telethon_client = TelegramClient('tiktok_recorder_session', API_ID, API_HASH, loop=telethon_loop)
+    
+    # Connect and check authorization
+    telethon_loop.run_until_complete(telethon_client.connect())
+    
+    if not telethon_loop.run_until_complete(telethon_client.is_user_authorized()):
+        logger.warning("Telethon client not authorized. Please run the auth script first.")
+    else:
+        logger.info("Telethon client connected and authorized successfully!")
+    
+    # Run the event loop
+    telethon_loop.run_forever()
+
+def main():
+    """Start the bot"""
     try:
-        # Create a new event loop for the main process
-        main_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(main_loop)
-        
-        # Initialize Telethon in a separate event loop
-        telethon_loop = asyncio.new_event_loop()
-        telethon_client = TelegramClient('tiktok_recorder_session', API_ID, API_HASH, loop=telethon_loop)
-        
-        # Start Telethon in the background
-        telethon_runner = TelethonLoopRunner()
-        telethon_runner.start()
-        
-        # Connect Telethon client
-        fut = asyncio.run_coroutine_threadsafe(telethon_client.connect(), telethon_loop)
-        fut.result()  # Wait for connection
-        
-        # Check authorization
-        fut = asyncio.run_coroutine_threadsafe(telethon_client.is_user_authorized(), telethon_loop)
-        if not fut.result():
-            logger.warning("Telethon client not authorized. Please run the auth script first.")
-        else:
-            logger.info("Telethon client connected and authorized successfully!")
-        
-        # Create the application
+        # Create the application and pass it your bot's token
         application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         
         # Register command handlers
@@ -2574,34 +2567,17 @@ def main():
         # Register text message handler
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
         
-        # Schedule the check active recordings function to run once at startup
-        application.job_queue.run_once(
-            lambda context: asyncio.run_coroutine_threadsafe(
-                check_active_recordings_on_startup(application), 
-                main_loop
-            ),
-            0
-        )
+        # Set up job queue and initialize Telethon
+        application.job_queue.run_once(lambda context: asyncio.create_task(setup_job_queue(application)), 0)
         
-        # Schedule the setup job queue function
-        application.job_queue.run_once(
-            lambda context: asyncio.run_coroutine_threadsafe(
-                setup_job_queue(application),
-                main_loop
-            ),
-            1
-        )
+        # Check for active recordings at startup
+        application.job_queue.run_once(lambda context: asyncio.create_task(check_active_recordings_on_startup(application)), 1)
         
-        # Start the bot - this will block until the bot is stopped
         logger.info("Starting bot...")
         application.run_polling(allowed_updates=Update.ALL_TYPES)
-        
     except Exception as e:
         logger.error(f"Critical error in main function: {e}")
-        # If telethon_runner exists, stop it
-        if 'telethon_runner' in locals():
-            telethon_runner.stop()
-        # Try to restart after delay
+        # Try to restart the bot after a delay
         logger.info("Restarting bot in 10 seconds...")
         time.sleep(10)
         main()
@@ -2621,6 +2597,11 @@ if __name__ == "__main__":
         # If no event loop exists, create a new one
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+    
+    # Start Telethon client in a separate thread to avoid conflicts with bot
+    telethon_thread = threading.Thread(target=start_telethon_client)
+    telethon_thread.daemon = True
+    telethon_thread.start()
     
     # Run the bot
     main()
