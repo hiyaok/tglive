@@ -1,3 +1,4 @@
+#
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -2207,20 +2208,23 @@ async def text_handler(update: Update, context: CallbackContext):
         await update.message.reply_text(f"❌ Error processing command: {str(e)}")
 
 # Function to start Telethon client in a separate thread
+# Function to start Telethon client in a separate thread
 def start_telethon_client():
     try:
         # Create a new event loop for this thread
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
-        # Connect and start the client
-        loop.run_until_complete(telethon_client.connect())
+        # Define an async init function
+        async def init_telethon():
+            await telethon_client.connect()
+            if not await telethon_client.is_user_authorized():
+                logger.warning("Telethon client not authorized. Using Bot API as fallback.")
+            else:
+                logger.info("Telethon client authorized and ready.")
         
-        # Check if the client is authorized
-        if not loop.run_until_complete(telethon_client.is_user_authorized()):
-            logger.warning("Telethon client not authorized. Using Bot API as fallback.")
-        else:
-            logger.info("Telethon client authorized and ready.")
+        # Run the async init function in the event loop
+        loop.run_until_complete(init_telethon())
     except Exception as e:
         logger.error(f"Error starting Telethon client: {e}")
 
