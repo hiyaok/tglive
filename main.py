@@ -1,3 +1,4 @@
+#
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -35,6 +36,7 @@ import sys
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
+from functools import wraps
 
 # Telegram imports
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -69,9 +71,6 @@ COOKIES_FILE = Path("cookies.json")
 
 # Initialize Telethon client
 telethon_client = TelegramClient('tiktok_recorder_session', API_ID, API_HASH)
-
-# Global event loop for main thread
-main_event_loop = asyncio.get_event_loop()
 
 # Enum Mode
 class Mode:
@@ -147,13 +146,15 @@ def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 # Admin-only decorator for command handlers
+# Fixed to handle variable number of arguments
 def admin_only(func):
-    async def wrapper(update: Update, context: CallbackContext):
+    @wraps(func)
+    async def wrapper(update: Update, context: CallbackContext, *args, **kwargs):
         user_id = update.effective_user.id
         if not is_admin(user_id):
             await update.message.reply_text("⛔ This bot is for admin use only.")
             return
-        return await func(update, context)
+        return await func(update, context, *args, **kwargs)
     return wrapper
 
 # Format time duration
@@ -163,15 +164,21 @@ def format_duration(seconds):
     minutes, seconds = divmod(remainder, 60)
     return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
 
-# Helper function to run async tasks in threads
-def run_async_in_thread(coro):
-    """Run an async coroutine in a thread-specific event loop"""
+# Helper to create event loop for threads
+def get_or_create_eventloop():
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
+        return asyncio.get_event_loop()
+    except RuntimeError as ex:
+        if "There is no current event loop in thread" in str(ex):
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            return loop
+        raise
+
+# Helper function to run async tasks from non-async code
+def run_async(coro):
+    loop = get_or_create_eventloop()
+    return loop.run_until_complete(coro)
 
 # HTTP Client
 class HttpClient:
@@ -698,16 +705,29 @@ class TikTokRecorder:
         
         # Send notification to admin users
         if self.context:
-            async def send_notifications():
-                for admin_id in ADMIN_IDS:
-                    await self._send_recording_started_notification(admin_id)
-            
-            # Run async notification in thread-safe way
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(send_notifications())
-            else:
-                asyncio.run(send_notifications())
+            for admin_id in ADMIN_IDS:
+                try:
+                    # Create proper notification message
+                    notification_message = (
+                        f"🔴 Started recording livestream for @{self.user}\n\n"
+                        f"🆔 Room ID: `{self.room_id}`\n"
+                        f"⏱️ Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                        f"📂 Output file: `{os.path.basename(self.output_file)}`"
+                    )
+                    
+                    # Use run_async to safely send notification
+                    async def send_notification():
+                        await self.context.bot.send_message(
+                            chat_id=admin_id,
+                            text=notification_message,
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                    
+                    # Send notification from main thread
+                    loop = get_or_create_eventloop()
+                    loop.run_until_complete(send_notification())
+                except Exception as e:
+                    logger.error(f"Error sending recording start notification: {e}")
         
         start_recording_time = datetime.now()
         recording_duration = 0
@@ -799,12 +819,11 @@ class TikTokRecorder:
         
         # Send to Telegram if enabled
         if self.use_telegram and self.context:
-            def send_telegram_video():
-                # Run in thread-specific event loop
-                run_async_in_thread(self.send_to_telegram(output_mp4, recording_duration))
-                
-            # Start a thread for telegram sending to avoid blocking
-            telegram_thread = threading.Thread(target=send_telegram_video)
+            # Start a new thread for sending to Telegram
+            telegram_thread = threading.Thread(
+                target=self.send_telegram_video_sync,
+                args=(output_mp4, recording_duration)
+            )
             telegram_thread.daemon = True
             telegram_thread.start()
             
@@ -821,21 +840,17 @@ class TikTokRecorder:
             
         if self.mode == Mode.AUTOMATIC:
             raise TikTokException(TikTokError.COUNTRY_BLACKLISTED)
-    
-    async def _send_recording_started_notification(self, user_id):
-        """Send notification that recording has started"""
-        try:
-            await self.context.bot.send_message(
-                chat_id=user_id,
-                text=f"🔴 Started recording livestream for @{self.user}\n\n"
-                     f"🆔 Room ID: `{self.room_id}`\n"
-                     f"⏱️ Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                     f"📂 Output file: `{os.path.basename(self.output_file)}`",
-                parse_mode=ParseMode.MARKDOWN
-            )
-        except Exception as e:
-            logger.error(f"Error sending start notification: {e}")
             
+    def send_telegram_video_sync(self, file_path, recording_duration):
+        """Synchronous wrapper for send_to_telegram to be called in a thread"""
+        try:
+            # Get event loop for this thread
+            loop = get_or_create_eventloop()
+            # Run the async function
+            loop.run_until_complete(self.send_to_telegram(file_path, recording_duration))
+        except Exception as e:
+            logger.error(f"Error in send_telegram_video_sync: {e}")
+    
     async def send_to_telegram(self, file_path, recording_duration):
         """Send recorded file to Telegram users using Telethon"""
         db = init_database()
@@ -1166,16 +1181,12 @@ async def list_accounts(update: Update, context: CallbackContext):
     user = ensure_user(db, user_id)
     
     if not user["tracked_accounts"]:
+        message = "📋 You are not tracking any TikTok accounts yet.\n\n" \
+                 "Use /add username to start tracking an account."
         if hasattr(update, 'message') and update.message:
-            await update.message.reply_text(
-                "📋 You are not tracking any TikTok accounts yet.\n\n"
-                "Use /add username to start tracking an account."
-            )
+            await update.message.reply_text(message)
         else:
-            await update.callback_query.edit_message_text(
-                "📋 You are not tracking any TikTok accounts yet.\n\n"
-                "Use /add username to start tracking an account."
-            )
+            await update.callback_query.edit_message_text(message)
         return
     
     # Create a list of tracked accounts with their status
@@ -1220,10 +1231,19 @@ async def list_accounts(update: Update, context: CallbackContext):
     else:
         await update.callback_query.edit_message_text(account_list, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
 
-@admin_only
 async def check_account(update: Update, context: CallbackContext, username: str):
     """Check if a TikTok account is currently live"""
+    # Directly access user ID without depending on admin_only decorator
     user_id = str(update.effective_user.id if update.effective_user else update.callback_query.from_user.id)
+    
+    # Check if user is admin
+    if not is_admin(int(user_id)):
+        if hasattr(update, 'message') and update.message:
+            await update.message.reply_text("⛔ This bot is for admin use only.")
+        else:
+            await update.callback_query.message.reply_text("⛔ This bot is for admin use only.")
+        return
+    
     db = init_database()
     user = ensure_user(db, user_id)
     
@@ -1373,9 +1393,19 @@ async def check_all_accounts(update: Update, context: CallbackContext):
         reply_markup=reply_markup
     )
 
-@admin_only
 async def show_active_recordings(update: Update, context: CallbackContext):
     """Show all active recordings"""
+    # Directly access user ID without depending on admin_only decorator
+    user_id = str(update.effective_user.id if update.effective_user else update.callback_query.from_user.id)
+    
+    # Check if user is admin
+    if not is_admin(int(user_id)):
+        if hasattr(update, 'message') and update.message:
+            await update.message.reply_text("⛔ This bot is for admin use only.")
+        else:
+            await update.callback_query.message.reply_text("⛔ This bot is for admin use only.")
+        return
+    
     db = init_database()
     
     active_recordings = []
@@ -1422,14 +1452,25 @@ async def show_active_recordings(update: Update, context: CallbackContext):
     else:
         await update.callback_query.edit_message_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
 
-@admin_only
 async def show_recordings_list(update: Update, context: CallbackContext):
     """Show list of completed recordings"""
+    # Directly access user ID without depending on admin_only decorator
+    user_id = str(update.effective_user.id if update.effective_user else update.callback_query.from_user.id)
+    
+    # Check if user is admin
+    if not is_admin(int(user_id)):
+        if hasattr(update, 'message') and update.message:
+            await update.message.reply_text("⛔ This bot is for admin use only.")
+        else:
+            await update.callback_query.message.reply_text("⛔ This bot is for admin use only.")
+        return
+    
     db = init_database()
     
     finished_recordings = db.get("finished_recordings", [])
     
     message = "📋 No completed recordings yet."
+    keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="recordings_list")]]
     
     if finished_recordings:
         # Sort by end time (newest first)
@@ -1479,27 +1520,24 @@ async def show_recordings_list(update: Update, context: CallbackContext):
             ])
         
         keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="recordings_list")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        if hasattr(update, 'message') and update.message:
-            await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
-        else:
-            await update.callback_query.edit_message_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if hasattr(update, 'message') and update.message:
+        await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
     else:
-        # No recordings, just add a refresh button
-        keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="recordings_list")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        if hasattr(update, 'message') and update.message:
-            await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
-        else:
-            await update.callback_query.edit_message_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+        await update.callback_query.edit_message_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
 
-@admin_only
 async def send_recording(update: Update, context: CallbackContext, index: int):
     """Send a specific recording to the user via Telethon"""
+    # Directly access user ID without depending on admin_only decorator
     query = update.callback_query
     user_id = query.from_user.id
+    
+    # Check if user is admin
+    if not is_admin(user_id):
+        await query.answer("⛔ This bot is for admin use only.")
+        return
     
     db = init_database()
     finished_recordings = db.get("finished_recordings", [])
@@ -1778,20 +1816,22 @@ def run_recording_thread(username, room_id, context):
                 account_info["last_error"] = str(e)
                 save_database(db)
                 
-                # Create a new async function to send notifications
-                async def send_error_notifications():
-                    for admin_id in ADMIN_IDS:
-                        try:
+                # Send error notifications
+                for admin_id in ADMIN_IDS:
+                    try:
+                        # Create async notification in the thread's event loop
+                        async def send_error_notification():
                             await context.bot.send_message(
                                 chat_id=admin_id,
                                 text=f"❌ Error recording @{username}'s livestream: {str(e)}",
                                 parse_mode=ParseMode.MARKDOWN
                             )
-                        except Exception as notify_error:
-                            logger.error(f"Error sending notification: {notify_error}")
-                
-                # Run the async function in a thread-specific event loop
-                run_async_in_thread(send_error_notifications())
+                        
+                        # Get or create event loop for this thread
+                        loop = get_or_create_eventloop()
+                        loop.run_until_complete(send_error_notification())
+                    except Exception as notify_err:
+                        logger.error(f"Error sending notification: {notify_err}")
     
     except Exception as e:
         logger.error(f"Thread error for {username}: {e}")
@@ -2056,6 +2096,7 @@ async def callback_handler(update: Update, context: CallbackContext):
     
     elif query.data.startswith("check_"):
         username = query.data.replace("check_", "")
+        # Call directly without admin_only decorator
         await check_account(update, context, username)
     
     elif query.data.startswith("send_recording_"):
@@ -2143,6 +2184,7 @@ async def text_handler(update: Update, context: CallbackContext):
         
         elif text.startswith("check "):
             username = text.split(" ", 1)[1].strip()
+            await check_username = text.split(" ", 1)[1].strip()
             await check_account(update, context, username)
         
         elif text == "list":
@@ -2165,6 +2207,24 @@ async def text_handler(update: Update, context: CallbackContext):
     except Exception as e:
         logger.error(f"Error in text handler: {e}")
         await update.message.reply_text(f"❌ Error processing command: {str(e)}")
+
+# Function to start Telethon client in a separate thread
+def start_telethon_client():
+    try:
+        # Create a new event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Connect and start the client
+        loop.run_until_complete(telethon_client.connect())
+        
+        # Check if the client is authorized
+        if not loop.run_until_complete(telethon_client.is_user_authorized()):
+            logger.warning("Telethon client not authorized. Using Bot API as fallback.")
+        else:
+            logger.info("Telethon client authorized and ready.")
+    except Exception as e:
+        logger.error(f"Error starting Telethon client: {e}")
 
 async def setup_job_queue(application):
     """Set up job queue for checking accounts"""
@@ -2194,21 +2254,6 @@ async def setup_job_queue(application):
         name="check_accounts"
     )
 
-async def initialize_telethon():
-    """Initialize Telethon client"""
-    global telethon_client
-    
-    if not telethon_client.is_connected():
-        logger.info("Connecting Telethon client...")
-        await telethon_client.connect()
-        
-        if not await telethon_client.is_user_authorized():
-            logger.warning("Telethon client not authorized. Using Bot API as fallback.")
-        else:
-            logger.info("Telethon client authorized and ready.")
-    
-    return telethon_client
-
 def main():
     """Start the bot"""
     try:
@@ -2234,7 +2279,6 @@ def main():
         
         # Set up job queue and initialize Telethon
         application.job_queue.run_once(lambda context: asyncio.create_task(setup_job_queue(application)), 0)
-        application.job_queue.run_once(lambda context: asyncio.create_task(initialize_telethon()), 0)
         
         logger.info("Starting bot...")
         application.run_polling(allowed_updates=Update.ALL_TYPES)
@@ -2262,7 +2306,9 @@ if __name__ == "__main__":
         asyncio.set_event_loop(loop)
     
     # Start Telethon client in a separate thread to avoid conflicts with bot
-    threading.Thread(target=lambda: asyncio.run(telethon_client.start())).start()
+    telethon_thread = threading.Thread(target=start_telethon_client)
+    telethon_thread.daemon = True
+    telethon_thread.start()
     
     # Run the bot
     main()
