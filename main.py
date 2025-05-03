@@ -1,3 +1,12 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# TikTok Livestream Tracker & Recorder Bot
+# Bot akan melacak akun TikTok dan merekam livestream secara otomatis
+
+# Token bot Telegram (ganti dengan token Anda)
+TELEGRAM_BOT_TOKEN = "7839177497:AAGRndTv7s1vGaI-vofXOop-yDqL1paPLQs"
+
 import os
 import json
 import time
@@ -5,37 +14,69 @@ import logging
 import asyncio
 import requests
 import subprocess
+import re
 import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
-import shutil
 
-import re
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackContext, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
-# Configure logging
+# Konfigurasi logging
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='[*] %(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Ensure directories exist
+# Pastikan direktori yang diperlukan ada
 RECORDINGS_DIR = Path("recordings")
 RECORDINGS_DIR.mkdir(exist_ok=True)
 
 DB_FILE = Path("database.json")
 COOKIES_FILE = Path("cookies.json")
 
-# Default cookies if needed
-DEFAULT_COOKIES = {
-    "sessionid_ss": "",
-    "tt-target-idc": "useast2a"
-}
+# Enum Mode
+class Mode:
+    MANUAL = 0
+    AUTOMATIC = 1
 
-# Initialize database
+# Enum TimeOut
+class TimeOut:
+    ONE_MINUTE = 60
+    CONNECTION_CLOSED = 2
+
+# HTTP Status Codes
+class StatusCode:
+    OK = 200
+    REDIRECT = 302
+    MOVED = 301
+
+# TikTok Error Messages
+class TikTokError:
+    USER_NOT_CURRENTLY_LIVE = "The user is not hosting a live stream at the moment."
+    RETRIEVE_LIVE_URL = "Unable to retrieve live streaming url. Please try again later."
+    ROOM_ID_ERROR = "Error extracting RoomID"
+    ACCOUNT_PRIVATE = "Account is private, login required."
+    COUNTRY_BLACKLISTED = "Captcha required or country blocked. Use a VPN, room_id, or authenticate with cookies."
+    WAF_BLOCKED = "Your IP is blocked by TikTok WAF. Please change your IP address."
+
+# Custom Exceptions
+class TikTokException(Exception):
+    pass
+
+class UserLiveException(Exception):
+    pass
+
+class LiveNotFound(Exception):
+    pass
+
+class IPBlockedByWAF(Exception):
+    pass
+
+# Inisialisasi database
 def init_database():
     if not DB_FILE.exists():
         with open(DB_FILE, "w") as f:
@@ -47,29 +88,39 @@ def init_database():
     with open(DB_FILE, "r") as f:
         return json.load(f)
 
-# Save database
+# Simpan database
 def save_database(db):
     with open(DB_FILE, "w") as f:
         json.dump(db, f, indent=2)
 
-# Initialize cookies
+# Inisialisasi cookies
 def init_cookies():
     if not COOKIES_FILE.exists():
         with open(COOKIES_FILE, "w") as f:
-            json.dump(DEFAULT_COOKIES, f, indent=2)
+            json.dump({
+                "sessionid_ss": "",
+                "tt-target-idc": "useast2a"
+            }, f, indent=2)
     
     with open(COOKIES_FILE, "r") as f:
         return json.load(f)
 
-# TikTok API Client
-class TikTokAPI:
+# HTTP Client
+class HttpClient:
     def __init__(self, proxy=None, cookies=None):
-        self.BASE_URL = 'https://www.tiktok.com'
-        self.WEBCAST_URL = 'https://webcast.tiktok.com'
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Safari/537.36",
             "Accept-Language": "en-US",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Ch-Ua": "\"Not/A)Brand\";v=\"8\", \"Chromium\";v=\"126\"",
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": "\"Linux\"",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-User": "?1",
+            "Sec-Fetch-Dest": "document",
             "Referer": "https://www.tiktok.com/"
         })
         
@@ -77,30 +128,122 @@ class TikTokAPI:
             self.session.cookies.update(cookies)
             
         if proxy:
-            self.session.proxies.update({
-                'http': proxy,
-                'https': proxy
-            })
-    
-    def get_room_id_from_user(self, username: str) -> str:
-        """Get TikTok live room ID from username"""
-        try:
-            response = self.session.get(f"{self.BASE_URL}/@{username}/live")
-            
-            if "Please wait..." in response.text:
-                logger.error(f"IP blocked by TikTok WAF for {username}")
-                return ""
+            logger.info(f"Testing proxy: {proxy}...")
+            try:
+                response = requests.get(
+                    "https://ifconfig.me/ip",
+                    proxies={"http": proxy, "https": proxy},
+                    timeout=10
+                )
                 
-            # Extract room ID from the page content
+                if response.status_code == StatusCode.OK:
+                    self.session.proxies.update({"http": proxy, "https": proxy})
+                    logger.info("Proxy set up successfully")
+            except Exception as e:
+                logger.error(f"Error setting up proxy: {e}")
+
+# TikTok API
+class TikTokAPI:
+    def __init__(self, proxy=None, cookies=None):
+        self.BASE_URL = 'https://www.tiktok.com'
+        self.WEBCAST_URL = 'https://webcast.tiktok.com'
+        self.http_client = HttpClient(proxy, cookies).session
+    
+    def is_country_blacklisted(self) -> bool:
+        """Checks if the user is in a blacklisted country that requires login"""
+        response = self.http_client.get(
+            f"{self.BASE_URL}/live",
+            allow_redirects=False
+        )
+        
+        return response.status_code == StatusCode.REDIRECT
+    
+    def is_room_alive(self, room_id: str) -> bool:
+        """Checking whether the user is live."""
+        if not room_id:
+            raise UserLiveException(TikTokError.USER_NOT_CURRENTLY_LIVE)
+
+        try:
+            data = self.http_client.get(
+                f"{self.WEBCAST_URL}/webcast/room/check_alive/"
+                f"?aid=1988&region=CH&room_ids={room_id}&user_is_login=true"
+            ).json()
+            
+            if 'data' not in data or len(data['data']) == 0:
+                return False
+                
+            return data['data'][0].get('alive', False)
+        except Exception as e:
+            logger.error(f"Error checking if room {room_id} is alive: {e}")
+            return False
+    
+    def get_user_from_room_id(self, room_id: str) -> str:
+        """Given a room_id, I get the username"""
+        try:
+            data = self.http_client.get(
+                f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}"
+            ).json()
+            
+            if 'This account is private' in str(data):
+                raise UserLiveException(TikTokError.ACCOUNT_PRIVATE)
+                
+            display_id = data.get("data", {}).get("owner", {}).get("display_id")
+            if display_id is None:
+                raise TikTokException("Username error")
+                
+            return display_id
+        except Exception as e:
+            logger.error(f"Error getting user from room ID {room_id}: {e}")
+            return ""
+    
+    def get_room_and_user_from_url(self, live_url: str):
+        """Given a url, get user and room_id."""
+        try:
+            response = self.http_client.get(live_url, allow_redirects=False)
+            content = response.text
+            
+            if response.status_code == StatusCode.REDIRECT:
+                raise UserLiveException(TikTokError.COUNTRY_BLACKLISTED)
+                
+            if response.status_code == StatusCode.MOVED:  # MOBILE URL
+                matches = re.findall("com/@(.*?)/live", content)
+                if len(matches) < 1:
+                    raise LiveNotFound(TikTokError.RETRIEVE_LIVE_URL)
+                    
+                user = matches[0]
+            
+            # https://www.tiktok.com/@<username>/live
+            match = re.match(
+                r"https?://(?:www\.)?tiktok\.com/@([^/]+)/live",
+                live_url
+            )
+            if match:
+                user = match.group(1)
+                
+            room_id = self.get_room_id_from_user(user)
+            
+            return user, room_id
+        except Exception as e:
+            logger.error(f"Error getting room and user from URL {live_url}: {e}")
+            raise
+    
+    def get_room_id_from_user(self, user: str) -> str:
+        """Given a username, I get the room_id"""
+        try:
+            content = self.http_client.get(
+                url=f'{self.BASE_URL}/@{user}/live'
+            ).text
+            
+            if 'Please wait...' in content:
+                raise IPBlockedByWAF()
+                
             pattern = re.compile(
                 r'<script id="SIGI_STATE" type="application/json">(.*?)</script>',
-                re.DOTALL
-            )
-            match = pattern.search(response.text)
+                re.DOTALL)
+            match = pattern.search(content)
             
-            if not match:
-                logger.error(f"Couldn't extract room ID for {username}")
-                return ""
+            if match is None:
+                raise UserLiveException(TikTokError.ROOM_ID_ERROR)
                 
             data = json.loads(match.group(1))
             
@@ -110,55 +253,30 @@ class TikTokAPI:
             room_id = data.get('LiveRoom', {}).get('liveRoomUserInfo', {}).get(
                 'user', {}).get('roomId', None)
                 
-            if not room_id:
-                logger.error(f"Room ID not found for {username}")
-                return ""
+            if room_id is None:
+                raise UserLiveException(TikTokError.ROOM_ID_ERROR)
                 
             return room_id
-            
         except Exception as e:
-            logger.error(f"Error getting room ID for {username}: {e}")
+            if isinstance(e, (UserLiveException, IPBlockedByWAF)):
+                raise
+            logger.error(f"Error getting room ID from user {user}: {e}")
             return ""
     
-    def is_room_alive(self, room_id: str) -> bool:
-        """Check if the room is currently live"""
-        if not room_id:
-            return False
-            
-        try:
-            response = self.session.get(
-                f"{self.WEBCAST_URL}/webcast/room/check_alive/"
-                f"?aid=1988&region=CH&room_ids={room_id}&user_is_login=true"
-            )
-            
-            data = response.json()
-            
-            if 'data' not in data or len(data['data']) == 0:
-                return False
-                
-            return data['data'][0].get('alive', False)
-            
-        except Exception as e:
-            logger.error(f"Error checking if room {room_id} is live: {e}")
-            return False
-    
     def get_live_url(self, room_id: str) -> str:
-        """Get the live streaming URL"""
+        """Return the cdn (flv or m3u8) of the streaming"""
         try:
-            response = self.session.get(
+            data = self.http_client.get(
                 f"{self.WEBCAST_URL}/webcast/room/info/?aid=1988&room_id={room_id}"
-            )
-            
-            data = response.json()
+            ).json()
             
             if 'This account is private' in str(data):
-                logger.error(f"Account with room ID {room_id} is private")
-                return ""
+                raise UserLiveException(TikTokError.ACCOUNT_PRIVATE)
                 
             stream_url = data.get('data', {}).get('stream_url', {})
             
             # Get the best quality available
-            live_url = (
+            live_url_flv = (
                 stream_url.get('flv_pull_url', {}).get('FULL_HD1') or
                 stream_url.get('flv_pull_url', {}).get('HD1') or
                 stream_url.get('flv_pull_url', {}).get('SD2') or
@@ -166,106 +284,373 @@ class TikTokAPI:
             )
             
             # If flv_pull_url is not available, use rtmp_pull_url
-            if not live_url:
-                live_url = stream_url.get('rtmp_pull_url', None)
+            if not live_url_flv:
+                live_url_flv = stream_url.get('rtmp_pull_url', None)
                 
-            if not live_url:
-                logger.error(f"Could not get live URL for room {room_id}")
-                return ""
+            if not live_url_flv and data.get('status_code') == 4003110:
+                raise UserLiveException("Live restriction")
                 
-            logger.info(f"Got live URL for room {room_id}: {live_url}")
-            return live_url
+            logger.info(f"Live URL: {live_url_flv}")
             
+            return live_url_flv
         except Exception as e:
+            if isinstance(e, UserLiveException):
+                raise
             logger.error(f"Error getting live URL for room {room_id}: {e}")
             return ""
+    
+    def download_live_stream(self, live_url: str):
+        """Generator yang mengembalikan streaming live untuk URL yang diberikan."""
+        try:
+            stream = self.http_client.get(live_url, stream=True)
+            for chunk in stream.iter_content(chunk_size=4096):
+                if not chunk:
+                    continue
+                    
+                yield chunk
+        except Exception as e:
+            logger.error(f"Error downloading live stream: {e}")
+            raise
+
+# Video Management
+class VideoManagement:
+    @staticmethod
+    def convert_flv_to_mp4(file_path: str):
+        """Convert FLV to MP4 format"""
+        logger.info(f"Converting {file_path} to MP4 format...")
+        
+        try:
+            output_file = file_path.replace('_flv.mp4', '.mp4')
+            
+            # Use ffmpeg to convert
+            subprocess.run([
+                "ffmpeg",
+                "-i", file_path,
+                "-c", "copy",
+                "-y", output_file
+            ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            
+            # Remove original file
+            os.remove(file_path)
+            
+            logger.info(f"Finished converting to {output_file}")
+            return output_file
+        except Exception as e:
+            logger.error(f"Error converting video: {e}")
+            return file_path
 
 # TikTok Recorder
 class TikTokRecorder:
-    def __init__(self, api, username, room_id, output_path):
-        self.api = api
-        self.username = username
+    def __init__(
+        self,
+        url,
+        user,
+        room_id,
+        mode,
+        automatic_interval,
+        cookies,
+        proxy,
+        output,
+        duration,
+        use_telegram,
+        context=None
+    ):
+        # Setup TikTok API client
+        self.tiktok = TikTokAPI(proxy=proxy, cookies=cookies)
+        
+        # TikTok Data
+        self.url = url
+        self.user = user
         self.room_id = room_id
-        self.output_path = output_path
-        self.recording_process = None
-        self.is_recording = False
-    
-    def start_recording(self):
-        """Start recording the live stream"""
-        if self.is_recording:
-            logger.info(f"Already recording {self.username}")
-            return
-            
-        live_url = self.api.get_live_url(self.room_id)
-        if not live_url:
-            logger.error(f"Couldn't get live URL for {self.username}")
-            return
-            
-        current_date = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        output_file = Path(self.output_path) / f"TK_{self.username}_{current_date}.mp4"
         
-        logger.info(f"Starting recording for {self.username} to {output_file}")
+        # Tool Settings
+        self.mode = mode
+        self.automatic_interval = automatic_interval
+        self.duration = duration
+        self.output = output
         
-        # Method 1: Use yt-dlp for recording (more reliable for TikTok)
-        try:
-            command = [
-                "yt-dlp", 
-                "-o", str(output_file),
-                "--no-part",
-                "--concurrent-fragments", "5",
-                live_url
-            ]
+        # Telegram context
+        self.context = context
+        
+        # Upload Settings
+        self.use_telegram = use_telegram
+        
+        # Check if the user's country is blacklisted
+        self.check_country_blacklisted()
+        
+        # Get live information based on the provided user data
+        if self.url:
+            self.user, self.room_id = self.tiktok.get_room_and_user_from_url(self.url)
             
-            self.recording_process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+        if not self.user and self.room_id:
+            self.user = self.tiktok.get_user_from_room_id(self.room_id)
+            
+        if not self.room_id and self.user:
+            self.room_id = self.tiktok.get_room_id_from_user(self.user)
+            
+        logger.info(f"USERNAME: {self.user}")
+        if self.room_id:
+            logger.info(f"ROOM_ID: {self.room_id}")
+            if self.tiktok.is_room_alive(self.room_id):
+                logger.info(f"Status: LIVE")
+            else:
+                logger.info(f"Status: OFFLINE")
+        
+        # If proxy is provided, set up the HTTP client without the proxy for recording
+        if proxy:
+            self.tiktok = TikTokAPI(proxy=None, cookies=cookies)
+            
+    def run(self):
+        """Runs the program in the selected mode."""
+        if self.mode == Mode.MANUAL:
+            self.manual_mode()
+            
+        if self.mode == Mode.AUTOMATIC:
+            self.automatic_mode()
+            
+    def manual_mode(self):
+        """Check once and record if live"""
+        if not self.tiktok.is_room_alive(self.room_id):
+            raise UserLiveException(
+                f"@{self.user}: {TikTokError.USER_NOT_CURRENTLY_LIVE}"
             )
             
-            self.is_recording = True
-            logger.info(f"Started recording {self.username} with yt-dlp")
-            return output_file
-            
-        except Exception as e:
-            logger.error(f"Error starting yt-dlp recording for {self.username}: {e}")
-            
-            # Method 2: Fallback to ffmpeg
+        self.start_recording()
+        
+    def automatic_mode(self):
+        """Continuously check if user is live"""
+        while True:
             try:
-                command = [
-                    "ffmpeg",
-                    "-y",
-                    "-re",
-                    "-i", live_url,
-                    "-c:v", "copy",
-                    "-c:a", "aac",
-                    "-b:a", "128k",
-                    str(output_file)
-                ]
+                self.room_id = self.tiktok.get_room_id_from_user(self.user)
+                self.manual_mode()
                 
-                self.recording_process = subprocess.Popen(
-                    command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
+            except UserLiveException as ex:
+                logger.info(ex)
+                logger.info(f"Waiting {self.automatic_interval} minutes before recheck\n")
+                time.sleep(self.automatic_interval * TimeOut.ONE_MINUTE)
+                
+            except ConnectionError:
+                logger.error("Connection closed in automatic mode")
+                time.sleep(TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE)
+                
+            except Exception as ex:
+                logger.error(f"Unexpected error: {ex}\n")
+                time.sleep(TimeOut.ONE_MINUTE)
+                
+    def start_recording(self):
+        """Start recording live"""
+        live_url = self.tiktok.get_live_url(self.room_id)
+        if not live_url:
+            raise LiveNotFound(TikTokError.RETRIEVE_LIVE_URL)
+            
+        current_date = time.strftime("%Y.%m.%d_%H-%M-%S", time.localtime())
+        
+        if isinstance(self.output, str) and self.output != '':
+            if not (self.output.endswith('/') or self.output.endswith('\\')):
+                if os.name == 'nt':
+                    self.output = self.output + "\\"
+                else:
+                    self.output = self.output + "/"
+                    
+        output = f"{self.output if self.output else ''}TK_{self.user}_{current_date}_flv.mp4"
+        
+        if self.duration:
+            logger.info(f"Started recording for {self.duration} seconds")
+        else:
+            logger.info("Started recording...")
+            
+        buffer_size = 512 * 1024  # 512 KB buffer
+        buffer = bytearray()
+        
+        logger.info("[PRESS CTRL + C ONCE TO STOP]")
+        
+        with open(output, "wb") as out_file:
+            stop_recording = False
+            while not stop_recording:
+                try:
+                    if not self.tiktok.is_room_alive(self.room_id):
+                        logger.info("User is no longer live. Stopping recording.")
+                        break
+                        
+                    start_time = time.time()
+                    for chunk in self.tiktok.download_live_stream(live_url):
+                        buffer.extend(chunk)
+                        if len(buffer) >= buffer_size:
+                            out_file.write(buffer)
+                            buffer.clear()
+                            
+                        elapsed_time = time.time() - start_time
+                        if self.duration and elapsed_time >= self.duration:
+                            stop_recording = True
+                            break
+                            
+                except ConnectionError:
+                    if self.mode == Mode.AUTOMATIC:
+                        logger.error("Connection closed in automatic mode")
+                        time.sleep(TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE)
+                        
+                except Exception as ex:
+                    if "RequestException" in str(type(ex)) or "HTTPException" in str(type(ex)):
+                        time.sleep(2)
+                    else:
+                        logger.error(f"Unexpected error: {ex}")
+                        stop_recording = True
+                        
+                except KeyboardInterrupt:
+                    logger.info("Recording stopped by user.")
+                    stop_recording = True
+                    
+                finally:
+                    if buffer:
+                        out_file.write(buffer)
+                        buffer.clear()
+                    out_file.flush()
+                    
+        logger.info(f"Recording finished: {output}")
+        
+        # Convert FLV to MP4
+        output_mp4 = VideoManagement.convert_flv_to_mp4(output)
+        
+        # Send to Telegram if enabled
+        if self.use_telegram and self.context:
+            self.send_to_telegram(output_mp4)
+            
+        return output_mp4
+            
+    def check_country_blacklisted(self):
+        """Check if user's country is blacklisted"""
+        is_blacklisted = self.tiktok.is_country_blacklisted()
+        if not is_blacklisted:
+            return False
+            
+        if self.room_id is None:
+            raise TikTokException(TikTokError.COUNTRY_BLACKLISTED)
+            
+        if self.mode == Mode.AUTOMATIC:
+            raise TikTokException(TikTokError.COUNTRY_BLACKLISTED)
+            
+    async def send_to_telegram(self, file_path):
+        """Send recorded file to Telegram users"""
+        db = init_database()
+        
+        if self.user not in db["tracked_accounts"]:
+            logger.error(f"Account {self.user} not found in tracked_accounts")
+            return
+            
+        account_info = db["tracked_accounts"][self.user]
+        
+        # Get file size
+        file_size_bytes = os.path.getsize(file_path)
+        file_size_mb = file_size_bytes / (1024 * 1024)
+        
+        logger.info(f"File size: {file_size_mb:.2f} MB")
+        
+        # Compress if too large for Telegram (50MB)
+        max_size = 50 * 1024 * 1024
+        compressed_file = None
+        
+        if file_size_bytes > max_size:
+            logger.info(f"File too large for Telegram. Compressing...")
+            
+            # Create compressed file name
+            compressed_file = file_path.replace('.mp4', '_compressed.mp4')
+            
+            # Compress with ffmpeg
+            subprocess.run([
+                "ffmpeg",
+                "-i", file_path,
+                "-c:v", "libx264",
+                "-crf", "23",
+                "-preset", "medium",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                compressed_file
+            ], check=True)
+            
+            # Check compressed size
+            compressed_size_bytes = os.path.getsize(compressed_file)
+            compressed_size_mb = compressed_size_bytes / (1024 * 1024)
+            
+            logger.info(f"Compressed file size: {compressed_size_mb:.2f} MB")
+            
+            # If still too large, compress more aggressively
+            if compressed_size_bytes > max_size:
+                logger.info("Compressed file still too large. Compressing more aggressively...")
+                
+                more_compressed = file_path.replace('.mp4', '_compressed_more.mp4')
+                
+                subprocess.run([
+                    "ffmpeg",
+                    "-i", compressed_file,
+                    "-c:v", "libx264",
+                    "-crf", "28",
+                    "-preset", "fast",
+                    "-c:a", "aac",
+                    "-b:a", "96k",
+                    "-s", "854x480",  # 480p
+                    more_compressed
+                ], check=True)
+                
+                # Remove first compressed file
+                os.remove(compressed_file)
+                compressed_file = more_compressed
+                
+                # Check new size
+                compressed_size_bytes = os.path.getsize(compressed_file)
+                compressed_size_mb = compressed_size_bytes / (1024 * 1024)
+                
+                logger.info(f"More compressed file size: {compressed_size_mb:.2f} MB")
+                
+        # Send to all users tracking this account
+        for user_id in account_info["tracked_by"]:
+            try:
+                send_file = compressed_file if compressed_file else file_path
+                send_size = os.path.getsize(send_file) / (1024 * 1024)
+                
+                # Check if still too large
+                if os.path.getsize(send_file) > max_size:
+                    await self.context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"⚠️ Recording of @{self.user}'s livestream is too large even after compression ({send_size:.2f} MB). File saved locally."
+                    )
+                    continue
+                    
+                # Send status message
+                status_msg = await self.context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"📤 Sending{'compressed ' if compressed_file else ' '}recording of @{self.user}'s livestream ({send_size:.2f} MB)..."
                 )
                 
-                self.is_recording = True
-                logger.info(f"Started recording {self.username} with ffmpeg")
-                return output_file
+                # Send the file
+                await self.context.bot.send_document(
+                    chat_id=user_id,
+                    document=open(send_file, 'rb'),
+                    caption=f"🎬 Recording of @{self.user}'s livestream{' (compressed)' if compressed_file else ''}\nSize: {send_size:.2f} MB\nRecorded on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+                
+                # Update status
+                await self.context.bot.edit_message_text(
+                    text=f"✅ Recording of @{self.user}'s livestream sent successfully!",
+                    chat_id=user_id,
+                    message_id=status_msg.message_id
+                )
                 
             except Exception as e:
-                logger.error(f"Error starting ffmpeg recording for {self.username}: {e}")
-                return None
-    
-    def stop_recording(self):
-        """Stop the recording process"""
-        if self.recording_process and self.is_recording:
-            self.recording_process.terminate()
-            self.is_recording = False
-            logger.info(f"Stopped recording {self.username}")
-            return True
-        return False
+                logger.error(f"Error sending to user {user_id}: {e}")
+                
+                try:
+                    await self.context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"❌ Error sending the recording: {str(e)}"
+                    )
+                except:
+                    pass
+                    
+        # Clean up compressed file
+        if compressed_file and os.path.exists(compressed_file):
+            os.remove(compressed_file)
 
-# Bot Helper functions
+# Bot Helper Functions
 def ensure_user(db, user_id):
     """Ensure the user exists in the database"""
     user_id_str = str(user_id)
@@ -275,7 +660,8 @@ def ensure_user(db, user_id):
             "settings": {
                 "notify_on_live": True,
                 "record_quality": "best",
-                "auto_compress": True
+                "auto_compress": True,
+                "check_interval": 5  # Default check interval in minutes
             }
         }
         save_database(db)
@@ -300,51 +686,55 @@ async def add_account(update: Update, context: CallbackContext, username: str):
     api = TikTokAPI(cookies=cookies)
     
     # Validate the TikTok account
-    await update.message.reply_text(f"🔍 Checking if @{username} exists...")
+    status_msg = await update.message.reply_text(f"🔍 Checking if @{username} exists...")
     
-    room_id = api.get_room_id_from_user(username)
-    if not room_id:
-        await update.message.reply_text(f"❌ Could not find TikTok account @{username} or the account has never been live.")
-        return
-    
-    # Add the account to user's tracked accounts
-    user["tracked_accounts"].append(username)
-    
-    # Add the account to global tracked accounts
-    if username not in db["tracked_accounts"]:
-        db["tracked_accounts"][username] = {
-            "is_live": False,
-            "is_recording": False,
-            "room_id": room_id,
-            "last_checked": None,
-            "last_live": None,
-            "tracked_by": [user_id]
-        }
-    elif user_id not in db["tracked_accounts"][username]["tracked_by"]:
-        db["tracked_accounts"][username]["tracked_by"].append(user_id)
-        db["tracked_accounts"][username]["room_id"] = room_id
-    
-    save_database(db)
-    
-    # Check if the account is currently live
-    is_live = api.is_room_alive(room_id)
-    if is_live:
-        db["tracked_accounts"][username]["is_live"] = True
-        db["tracked_accounts"][username]["last_live"] = datetime.now().isoformat()
+    try:
+        room_id = api.get_room_id_from_user(username)
+        if not room_id:
+            await status_msg.edit_text(f"❌ Could not find TikTok account @{username} or the account has never been live.")
+            return
+        
+        # Add the account to user's tracked accounts
+        user["tracked_accounts"].append(username)
+        
+        # Add the account to global tracked accounts
+        if username not in db["tracked_accounts"]:
+            db["tracked_accounts"][username] = {
+                "is_live": False,
+                "is_recording": False,
+                "room_id": room_id,
+                "last_checked": None,
+                "last_live": None,
+                "tracked_by": [user_id]
+            }
+        elif user_id not in db["tracked_accounts"][username]["tracked_by"]:
+            db["tracked_accounts"][username]["tracked_by"].append(user_id)
+            db["tracked_accounts"][username]["room_id"] = room_id
+        
         save_database(db)
         
-        await update.message.reply_text(
-            f"✅ Successfully added @{username} to your tracked accounts.\n\n"
-            f"🔴 @{username} is currently LIVE! Recording has started automatically."
-        )
-        
-        # Start the recording
-        await start_recording_for_account(username, context)
-    else:
-        await update.message.reply_text(
-            f"✅ Successfully added @{username} to your tracked accounts.\n\n"
-            f"The bot will automatically check if @{username} goes live and notify you."
-        )
+        # Check if the account is currently live
+        is_live = api.is_room_alive(room_id)
+        if is_live:
+            db["tracked_accounts"][username]["is_live"] = True
+            db["tracked_accounts"][username]["last_live"] = datetime.now().isoformat()
+            save_database(db)
+            
+            await status_msg.edit_text(
+                f"✅ Successfully added @{username} to your tracked accounts.\n\n"
+                f"🔴 @{username} is currently LIVE! Recording has started automatically."
+            )
+            
+            # Start the recording
+            await start_recording_for_account(username, context)
+        else:
+            await status_msg.edit_text(
+                f"✅ Successfully added @{username} to your tracked accounts.\n\n"
+                f"The bot will automatically check if @{username} goes live and notify you."
+            )
+    except Exception as e:
+        logger.error(f"Error adding account {username}: {e}")
+        await status_msg.edit_text(f"❌ Error adding account: {str(e)}")
 
 async def remove_account(update: Update, context: CallbackContext, username: str):
     """Remove a TikTok account from tracking"""
@@ -432,13 +822,13 @@ async def check_account(update: Update, context: CallbackContext, username: str)
     api = TikTokAPI(cookies=cookies)
     
     # Check if the account is live
-    await update.message.reply_text(f"🔍 Checking if @{username} is live...")
+    status_msg = await update.message.reply_text(f"🔍 Checking if @{username} is live...")
     
     account_info = db["tracked_accounts"][username]
-    room_id = account_info.get("room_id") or api.get_room_id_from_user(username)
+    room_id = account_info.get("room_id", "") or api.get_room_id_from_user(username)
     
     if not room_id:
-        await update.message.reply_text(f"❌ Could not find room ID for @{username}.")
+        await status_msg.edit_text(f"❌ Could not find room ID for @{username}.")
         return
     
     is_live = api.is_room_alive(room_id)
@@ -456,12 +846,12 @@ async def check_account(update: Update, context: CallbackContext, username: str)
     if is_live:
         # Check if already recording
         if account_info.get("is_recording", False):
-            await update.message.reply_text(
+            await status_msg.edit_text(
                 f"🔴 @{username} is currently LIVE!\n"
                 f"📹 Already recording this livestream."
             )
         else:
-            await update.message.reply_text(
+            await status_msg.edit_text(
                 f"🔴 @{username} is currently LIVE!\n"
                 f"📹 Starting to record this livestream..."
             )
@@ -469,7 +859,7 @@ async def check_account(update: Update, context: CallbackContext, username: str)
             # Start the recording
             await start_recording_for_account(username, context)
     else:
-        await update.message.reply_text(f"⚫ @{username} is not currently live.")
+        await status_msg.edit_text(f"⚫ @{username} is not currently live.")
 
 async def check_all_accounts(update: Update, context: CallbackContext):
     """Check all tracked accounts if they are live"""
@@ -494,7 +884,7 @@ async def check_all_accounts(update: Update, context: CallbackContext):
         account_info = db["tracked_accounts"][username]
         
         # Get room ID
-        room_id = account_info.get("room_id") or api.get_room_id_from_user(username)
+        room_id = account_info.get("room_id", "") or api.get_room_id_from_user(username)
         
         if not room_id:
             results += f"❌ Could not find room ID for @{username}.\n"
@@ -529,7 +919,7 @@ async def check_all_accounts(update: Update, context: CallbackContext):
     # Update the status message
     await status_msg.edit_text(
         f"📊 Status of your tracked accounts:\n\n{results}\n"
-        f"{live_count > 0 ? f'🎉 {live_count} account(s) are currently live!' : '😴 None of your tracked accounts are currently live.'}"
+        f"{'🎉 ' + str(live_count) + ' account(s) are currently live!' if live_count > 0 else '😴 None of your tracked accounts are currently live.'}"
     )
 
 async def start_recording_for_account(username: str, context: CallbackContext):
@@ -552,7 +942,7 @@ async def start_recording_for_account(username: str, context: CallbackContext):
     api = TikTokAPI(cookies=cookies)
     
     # Get room ID if not available
-    room_id = account_info.get("room_id") or api.get_room_id_from_user(username)
+    room_id = account_info.get("room_id", "") or api.get_room_id_from_user(username)
     
     if not room_id:
         logger.error(f"Could not find room ID for {username}")
@@ -580,30 +970,6 @@ async def start_recording_for_account(username: str, context: CallbackContext):
     account_info["recording_start_time"] = datetime.now().isoformat()
     save_database(db)
     
-    # Create recorder
-    recorder = TikTokRecorder(
-        api=api,
-        username=username,
-        room_id=room_id,
-        output_path=RECORDINGS_DIR
-    )
-    
-    # Start recording in a separate thread
-    output_file = recorder.start_recording()
-    
-    if not output_file:
-        logger.error(f"Failed to start recording for {username}")
-        account_info["is_recording"] = False
-        save_database(db)
-        
-        # Notify users
-        for user_id in account_info["tracked_by"]:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"❌ Failed to start recording for @{username}."
-            )
-        return
-    
     # Notify users
     for user_id in account_info["tracked_by"]:
         await context.bot.send_message(
@@ -611,186 +977,64 @@ async def start_recording_for_account(username: str, context: CallbackContext):
             text=f"🔴 @{username} is now LIVE! Recording started automatically."
         )
     
-    # Monitor recording in background
-    asyncio.create_task(monitor_recording(username, recorder, output_file, context))
+    # Start recording in a separate thread
+    thread = threading.Thread(
+        target=run_recording_thread,
+        args=(username, room_id, context)
+    )
+    thread.daemon = True
+    thread.start()
 
-async def monitor_recording(username: str, recorder: TikTokRecorder, output_file: Path, context: CallbackContext):
-    """Monitor recording and send when finished"""
-    db = init_database()
-    account_info = db["tracked_accounts"].get(username)
-    
-    if not account_info:
-        logger.error(f"Account {username} not found in tracked_accounts during monitoring")
-        return
-    
+def run_recording_thread(username, room_id, context):
+    """Run recording in a separate thread"""
     try:
-        # Initialize API
-        cookies = init_cookies()
-        api = TikTokAPI(cookies=cookies)
-        
-        # Monitor until the process ends or the user stops streaming
-        while recorder.is_recording:
-            # Check if the account is still live
-            is_live = api.is_room_alive(recorder.room_id)
-            
-            if not is_live:
-                logger.info(f"{username} is no longer live. Stopping recording.")
-                recorder.stop_recording()
-                break
-            
-            # Wait before checking again
-            await asyncio.sleep(30)
-        
-        # Update database
-        db = init_database()  # Reload to get latest state
-        if username in db["tracked_accounts"]:
-            account_info = db["tracked_accounts"][username]
-            account_info["is_recording"] = False
-            account_info["is_live"] = False
-            account_info["recording_end_time"] = datetime.now().isoformat()
-            account_info["last_recording_file"] = str(output_file)
-            save_database(db)
-        
-        logger.info(f"Recording for {username} finished. Sending to users...")
-        
-        # Get file size
-        file_size_bytes = output_file.stat().st_size
-        file_size_mb = file_size_bytes / (1024 * 1024)
-        
-        logger.info(f"Recording file size: {file_size_mb:.2f} MB")
-        
-        # Compress if too large for Telegram (50MB)
-        compressed_file = None
-        if file_size_bytes > 50 * 1024 * 1024:
-            logger.info(f"File too large for Telegram ({file_size_mb:.2f} MB). Compressing...")
-            
-            # Notify users
-            for user_id in account_info["tracked_by"]:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"📦 The recording of @{username}'s livestream is too large ({file_size_mb:.2f} MB) for Telegram. Compressing while maintaining HD quality. This may take some time..."
-                )
-            
-            # Compress the file
-            compressed_file = output_file.with_name(f"{output_file.stem}_compressed{output_file.suffix}")
-            
-            # Use ffmpeg to compress
-            subprocess.run([
-                "ffmpeg",
-                "-i", str(output_file),
-                "-c:v", "libx264",
-                "-crf", "23",
-                "-preset", "medium",
-                "-c:a", "aac",
-                "-b:a", "128k",
-                str(compressed_file)
-            ], check=True)
-            
-            # Check compressed file size
-            compressed_size_bytes = compressed_file.stat().st_size
-            compressed_size_mb = compressed_size_bytes / (1024 * 1024)
-            
-            logger.info(f"Compressed file size: {compressed_size_mb:.2f} MB")
-            
-            # If still too large
-            if compressed_size_bytes > 50 * 1024 * 1024:
-                logger.warning(f"Compressed file still too large ({compressed_size_mb:.2f} MB)")
-                
-                # Try more aggressive compression
-                more_compressed_file = output_file.with_name(f"{output_file.stem}_compressed_more{output_file.suffix}")
-                
-                subprocess.run([
-                    "ffmpeg",
-                    "-i", str(compressed_file),
-                    "-c:v", "libx264",
-                    "-crf", "28",
-                    "-preset", "fast",
-                    "-c:a", "aac",
-                    "-b:a", "96k",
-                    "-s", "854x480",  # Reduce resolution to 480p
-                    str(more_compressed_file)
-                ], check=True)
-                
-                # Replace compressed file
-                compressed_file.unlink()
-                compressed_file = more_compressed_file
-                
-                # Check new compressed file size
-                compressed_size_bytes = compressed_file.stat().st_size
-                compressed_size_mb = compressed_size_bytes / (1024 * 1024)
-                
-                logger.info(f"More compressed file size: {compressed_size_mb:.2f} MB")
-        
-        # Send file to all users who track this account
-        for user_id in account_info["tracked_by"]:
-            try:
-                # Use the compressed file if available and needed
-                send_file = compressed_file if compressed_file and file_size_bytes > 50 * 1024 * 1024 else output_file
-                
-                # If still too large, just notify
-                if send_file.stat().st_size > 50 * 1024 * 1024:
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=f"⚠️ The recording of @{username}'s livestream is too large even after compression. The file has been saved locally. Contact the bot administrator to get it."
-                    )
-                    continue
-                
-                # Send a status message
-                status_msg = await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"📤 Sending {'compressed ' if compressed_file and file_size_bytes > 50 * 1024 * 1024 else ''}recording of @{username}'s livestream..."
-                )
-                
-                # Send the video file
-                await context.bot.send_document(
-                    chat_id=user_id,
-                    document=send_file,
-                    caption=f"🎬 Recording of @{username}'s livestream{'(compressed)' if compressed_file and file_size_bytes > 50 * 1024 * 1024 else ''}\nSize: {(compressed_size_mb if compressed_file and file_size_bytes > 50 * 1024 * 1024 else file_size_mb):.2f} MB\nRecorded on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                )
-                
-                # Update status message
-                await context.bot.edit_message_text(
-                    text=f"✅ Recording of @{username}'s livestream sent successfully!",
-                    chat_id=user_id,
-                    message_id=status_msg.message_id
-                )
-                
-            except Exception as e:
-                logger.error(f"Error sending recording to user {user_id}: {e}")
-                
-                try:
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=f"❌ Error sending the recording of @{username}'s livestream: {str(e)}"
-                    )
-                except:
-                    pass
-        
-        # Clean up compressed file if it exists
-        if compressed_file and compressed_file.exists():
-            compressed_file.unlink()
-            
-    except Exception as e:
-        logger.error(f"Error in monitor_recording for {username}: {e}")
-        
-        # Update database to mark recording as stopped
+        # Initialize for recording
         db = init_database()
-        if username in db["tracked_accounts"]:
-            account_info = db["tracked_accounts"][username]
-            account_info["is_recording"] = False
-            account_info["is_live"] = False
-            account_info["last_error"] = str(e)
-            save_database(db)
+        account_info = db["tracked_accounts"][username]
+        cookies = init_cookies()
+        
+        # Create recorder
+        recorder = TikTokRecorder(
+            url=None,
+            user=username,
+            room_id=room_id,
+            mode=Mode.MANUAL,
+            automatic_interval=5,
+            cookies=cookies,
+            proxy=None,
+            output="recordings/",
+            duration=None,
+            use_telegram=True,
+            context=context
+        )
+        
+        # Start recording
+        try:
+            output_file = recorder.start_recording()
             
-            # Notify users
-            for user_id in account_info["tracked_by"]:
-                try:
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=f"❌ Error recording @{username}'s livestream: {str(e)}"
-                    )
-                except:
-                    pass
+            # Update database when finished
+            db = init_database()  # Reload to get latest state
+            if username in db["tracked_accounts"]:
+                account_info = db["tracked_accounts"][username]
+                account_info["is_recording"] = False
+                account_info["is_live"] = False
+                account_info["recording_end_time"] = datetime.now().isoformat()
+                account_info["last_recording_file"] = str(output_file)
+                save_database(db)
+                
+        except Exception as e:
+            logger.error(f"Error recording {username}: {e}")
+            
+            # Update database
+            db = init_database()
+            if username in db["tracked_accounts"]:
+                account_info = db["tracked_accounts"][username]
+                account_info["is_recording"] = False
+                account_info["last_error"] = str(e)
+                save_database(db)
+    
+    except Exception as e:
+        logger.error(f"Thread error for {username}: {e}")
 
 async def check_tracked_accounts_job(context: CallbackContext):
     """Check all tracked accounts to see if they're live (periodic job)"""
@@ -816,7 +1060,7 @@ async def check_tracked_accounts_job(context: CallbackContext):
             logger.info(f"Checking if {username} is live...")
             
             # Get room ID
-            room_id = account_info.get("room_id") or api.get_room_id_from_user(username)
+            room_id = account_info.get("room_id", "") or api.get_room_id_from_user(username)
             
             if not room_id:
                 logger.error(f"Could not find room ID for {username}")
@@ -886,8 +1130,9 @@ async def help_command(update: Update, context: CallbackContext):
         f"⚙️ /settings - Configure bot settings\n"
         f"🔄 /check - Manually check if tracked accounts are live\n"
         f"❓ /help - Show this help message\n\n"
-        f"The bot automatically checks for livestreams every minute. When a tracked account goes live, "
-        f"it will notify you and start recording. When the livestream ends, it will send you the recording.",
+        f"The bot automatically checks for livestreams based on your settings interval. "
+        f"When a tracked account goes live, it will notify you and start recording. "
+        f"When the livestream ends, it will send you the recording.",
         parse_mode="Markdown"
     )
 
@@ -937,16 +1182,20 @@ async def settings_command(update: Update, context: CallbackContext):
     
     keyboard = [
         [InlineKeyboardButton(
-            f"🔔 Notifications: {'ON' if settings['notify_on_live'] else 'OFF'}", 
+            f"🔔 Notifications: {'ON' if settings.get('notify_on_live', True) else 'OFF'}", 
             callback_data="toggle_notifications"
         )],
         [InlineKeyboardButton(
-            f"🗜️ Auto-compress: {'ON' if settings['auto_compress'] else 'OFF'}", 
+            f"🗜️ Auto-compress: {'ON' if settings.get('auto_compress', True) else 'OFF'}", 
             callback_data="toggle_autocompress"
         )],
         [InlineKeyboardButton(
-            f"🎥 Quality: {settings['record_quality']}", 
+            f"🎥 Quality: {settings.get('record_quality', 'best')}", 
             callback_data="cycle_quality"
+        )],
+        [InlineKeyboardButton(
+            f"⏱️ Check Interval: {settings.get('check_interval', 5)} min", 
+            callback_data="cycle_interval"
         )]
     ]
     
@@ -954,9 +1203,10 @@ async def settings_command(update: Update, context: CallbackContext):
     
     await update.message.reply_text(
         f"⚙️ *Settings*\n\n"
-        f"🔔 Notify when account goes live: {'✅ ON' if settings['notify_on_live'] else '❌ OFF'}\n"
-        f"🎥 Recording quality: {settings['record_quality']}\n"
-        f"🗜️ Auto-compress large files: {'✅ ON' if settings['auto_compress'] else '❌ OFF'}\n\n"
+        f"🔔 Notify when account goes live: {'✅ ON' if settings.get('notify_on_live', True) else '❌ OFF'}\n"
+        f"🎥 Recording quality: {settings.get('record_quality', 'best')}\n"
+        f"🗜️ Auto-compress large files: {'✅ ON' if settings.get('auto_compress', True) else '❌ OFF'}\n"
+        f"⏱️ Check interval: {settings.get('check_interval', 5)} minutes\n\n"
         f"Select a setting to change:",
         parse_mode="Markdown",
         reply_markup=reply_markup
@@ -998,39 +1248,85 @@ async def callback_handler(update: Update, context: CallbackContext):
     
     elif query.data == "toggle_notifications":
         settings = user["settings"]
-        settings["notify_on_live"] = not settings["notify_on_live"]
+        settings["notify_on_live"] = not settings.get("notify_on_live", True)
         save_database(db)
+        
+        # Update keyboard
+        keyboard = [
+            [InlineKeyboardButton(
+                f"🔔 Notifications: {'ON' if settings.get('notify_on_live', True) else 'OFF'}", 
+                callback_data="toggle_notifications"
+            )],
+            [InlineKeyboardButton(
+                f"🗜️ Auto-compress: {'ON' if settings.get('auto_compress', True) else 'OFF'}", 
+                callback_data="toggle_autocompress"
+            )],
+            [InlineKeyboardButton(
+                f"🎥 Quality: {settings.get('record_quality', 'best')}", 
+                callback_data="cycle_quality"
+            )],
+            [InlineKeyboardButton(
+                f"⏱️ Check Interval: {settings.get('check_interval', 5)} min", 
+                callback_data="cycle_interval"
+            )]
+        ]
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(
             f"⚙️ *Settings*\n\n"
-            f"🔔 Notify when account goes live: {'✅ ON' if settings['notify_on_live'] else '❌ OFF'}\n"
-            f"🎥 Recording quality: {settings['record_quality']}\n"
-            f"🗜️ Auto-compress large files: {'✅ ON' if settings['auto_compress'] else '❌ OFF'}\n\n"
-            f"Setting updated! Notifications are now {'ON' if settings['notify_on_live'] else 'OFF'}.",
+            f"🔔 Notify when account goes live: {'✅ ON' if settings.get('notify_on_live', True) else '❌ OFF'}\n"
+            f"🎥 Recording quality: {settings.get('record_quality', 'best')}\n"
+            f"🗜️ Auto-compress large files: {'✅ ON' if settings.get('auto_compress', True) else '❌ OFF'}\n"
+            f"⏱️ Check interval: {settings.get('check_interval', 5)} minutes\n\n"
+            f"Setting updated! Notifications are now {'ON' if settings.get('notify_on_live', True) else 'OFF'}.",
             parse_mode="Markdown",
-            reply_markup=query.message.reply_markup
+            reply_markup=reply_markup
         )
     
     elif query.data == "toggle_autocompress":
         settings = user["settings"]
-        settings["auto_compress"] = not settings["auto_compress"]
+        settings["auto_compress"] = not settings.get("auto_compress", True)
         save_database(db)
+        
+        # Update keyboard
+        keyboard = [
+            [InlineKeyboardButton(
+                f"🔔 Notifications: {'ON' if settings.get('notify_on_live', True) else 'OFF'}", 
+                callback_data="toggle_notifications"
+            )],
+            [InlineKeyboardButton(
+                f"🗜️ Auto-compress: {'ON' if settings.get('auto_compress', True) else 'OFF'}", 
+                callback_data="toggle_autocompress"
+            )],
+            [InlineKeyboardButton(
+                f"🎥 Quality: {settings.get('record_quality', 'best')}", 
+                callback_data="cycle_quality"
+            )],
+            [InlineKeyboardButton(
+                f"⏱️ Check Interval: {settings.get('check_interval', 5)} min", 
+                callback_data="cycle_interval"
+            )]
+        ]
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(
             f"⚙️ *Settings*\n\n"
-            f"🔔 Notify when account goes live: {'✅ ON' if settings['notify_on_live'] else '❌ OFF'}\n"
-            f"🎥 Recording quality: {settings['record_quality']}\n"
-            f"🗜️ Auto-compress large files: {'✅ ON' if settings['auto_compress'] else '❌ OFF'}\n\n"
-            f"Setting updated! Auto-compress is now {'ON' if settings['auto_compress'] else 'OFF'}.",
+            f"🔔 Notify when account goes live: {'✅ ON' if settings.get('notify_on_live', True) else '❌ OFF'}\n"
+            f"🎥 Recording quality: {settings.get('record_quality', 'best')}\n"
+            f"🗜️ Auto-compress large files: {'✅ ON' if settings.get('auto_compress', True) else '❌ OFF'}\n"
+            f"⏱️ Check interval: {settings.get('check_interval', 5)} minutes\n\n"
+            f"Setting updated! Auto-compress is now {'ON' if settings.get('auto_compress', True) else 'OFF'}.",
             parse_mode="Markdown",
-            reply_markup=query.message.reply_markup
+            reply_markup=reply_markup
         )
     
     elif query.data == "cycle_quality":
         settings = user["settings"]
         
         # Cycle through quality options
-        if settings["record_quality"] == "best":
+        if settings.get("record_quality", "best") == "best":
             settings["record_quality"] = "high"
         elif settings["record_quality"] == "high":
             settings["record_quality"] = "medium"
@@ -1039,14 +1335,98 @@ async def callback_handler(update: Update, context: CallbackContext):
         
         save_database(db)
         
+        # Update keyboard
+        keyboard = [
+            [InlineKeyboardButton(
+                f"🔔 Notifications: {'ON' if settings.get('notify_on_live', True) else 'OFF'}", 
+                callback_data="toggle_notifications"
+            )],
+            [InlineKeyboardButton(
+                f"🗜️ Auto-compress: {'ON' if settings.get('auto_compress', True) else 'OFF'}", 
+                callback_data="toggle_autocompress"
+            )],
+            [InlineKeyboardButton(
+                f"🎥 Quality: {settings.get('record_quality', 'best')}", 
+                callback_data="cycle_quality"
+            )],
+            [InlineKeyboardButton(
+                f"⏱️ Check Interval: {settings.get('check_interval', 5)} min", 
+                callback_data="cycle_interval"
+            )]
+        ]
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
         await query.edit_message_text(
             f"⚙️ *Settings*\n\n"
-            f"🔔 Notify when account goes live: {'✅ ON' if settings['notify_on_live'] else '❌ OFF'}\n"
-            f"🎥 Recording quality: {settings['record_quality']}\n"
-            f"🗜️ Auto-compress large files: {'✅ ON' if settings['auto_compress'] else '❌ OFF'}\n\n"
-            f"Setting updated! Quality is now set to {settings['record_quality']}.",
+            f"🔔 Notify when account goes live: {'✅ ON' if settings.get('notify_on_live', True) else '❌ OFF'}\n"
+            f"🎥 Recording quality: {settings.get('record_quality', 'best')}\n"
+            f"🗜️ Auto-compress large files: {'✅ ON' if settings.get('auto_compress', True) else '❌ OFF'}\n"
+            f"⏱️ Check interval: {settings.get('check_interval', 5)} minutes\n\n"
+            f"Setting updated! Quality is now set to {settings.get('record_quality', 'best')}.",
             parse_mode="Markdown",
-            reply_markup=query.message.reply_markup
+            reply_markup=reply_markup
+        )
+    
+    elif query.data == "cycle_interval":
+        settings = user["settings"]
+        
+        # Cycle through interval options: 1, 3, 5, 10, 15, 30, 60 minutes
+        intervals = [1, 3, 5, 10, 15, 30, 60]
+        current = settings.get("check_interval", 5)
+        
+        # Find next interval
+        next_index = 0
+        for i, interval in enumerate(intervals):
+            if interval > current:
+                next_index = i
+                break
+        
+        settings["check_interval"] = intervals[next_index % len(intervals)]
+        save_database(db)
+        
+        # Restart the job with new interval
+        for job in context.job_queue.get_jobs_by_name("check_accounts"):
+            job.schedule_removal()
+        
+        context.job_queue.run_repeating(
+            check_tracked_accounts_job,
+            interval=settings["check_interval"] * 60,
+            first=10,
+            name="check_accounts"
+        )
+        
+        # Update keyboard
+        keyboard = [
+            [InlineKeyboardButton(
+                f"🔔 Notifications: {'ON' if settings.get('notify_on_live', True) else 'OFF'}", 
+                callback_data="toggle_notifications"
+            )],
+            [InlineKeyboardButton(
+                f"🗜️ Auto-compress: {'ON' if settings.get('auto_compress', True) else 'OFF'}", 
+                callback_data="toggle_autocompress"
+            )],
+            [InlineKeyboardButton(
+                f"🎥 Quality: {settings.get('record_quality', 'best')}", 
+                callback_data="cycle_quality"
+            )],
+            [InlineKeyboardButton(
+                f"⏱️ Check Interval: {settings.get('check_interval', 5)} min", 
+                callback_data="cycle_interval"
+            )]
+        ]
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"⚙️ *Settings*\n\n"
+            f"🔔 Notify when account goes live: {'✅ ON' if settings.get('notify_on_live', True) else '❌ OFF'}\n"
+            f"🎥 Recording quality: {settings.get('record_quality', 'best')}\n"
+            f"🗜️ Auto-compress large files: {'✅ ON' if settings.get('auto_compress', True) else '❌ OFF'}\n"
+            f"⏱️ Check interval: {settings.get('check_interval', 5)} minutes\n\n"
+            f"Setting updated! Check interval is now set to {settings.get('check_interval', 5)} minutes.",
+            parse_mode="Markdown",
+            reply_markup=reply_markup
         )
 
 async def text_handler(update: Update, context: CallbackContext):
@@ -1077,15 +1457,26 @@ async def text_handler(update: Update, context: CallbackContext):
     elif text == "help":
         await help_command(update, context)
 
+async def setup_job_queue(application):
+    """Set up job queue for checking accounts"""
+    job_queue = application.job_queue
+    
+    # Get check interval from database settings
+    db = init_database()
+    
+    # Set default check interval to 5 minutes
+    check_interval = 5
+    
+    # Set up the job
+    job_queue.run_repeating(
+        check_tracked_accounts_job,
+        interval=check_interval * 60,
+        first=10,
+        name="check_accounts"
+    )
+
 def main():
     """Start the bot"""
-    # Get bot token from environment variable
-    TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-    
-    if not TELEGRAM_BOT_TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN not set. Please set it in the environment variables.")
-        return
-    
     # Create the application and pass it your bot's token
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
@@ -1104,14 +1495,11 @@ def main():
     # Register text message handler
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     
-    # Set up the job queue to periodically check tracked accounts
-    job_queue = application.job_queue
-    job_queue.run_repeating(check_tracked_accounts_job, interval=60, first=10)
+    # Set up job queue
+    application.job_queue.run_once(lambda context: asyncio.create_task(setup_job_queue(application)), 0)
     
-    # Start the Bot
-    application.run_polling()
-    
-    logger.info("Bot started!")
+    logger.info("Starting bot...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
