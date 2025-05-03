@@ -9,9 +9,14 @@
 # - Multiple simultaneous recording support
 # - Enhanced compression for large files
 # - Detailed notifications and logging
+# - Telethon integration for sending videos
 
 # Token bot Telegram (ganti dengan token Anda)
-TELEGRAM_BOT_TOKEN = "7839177497:AAGRndTv7s1vGaI-vofXOop-yDqL1paPLQs"
+TELEGRAM_BOT_TOKEN = "7839177497:AAF4kpg0ezNzIS32NyYHTWunQVU3TRtJcWQ"
+
+# Telethon API info (add your own)
+API_ID = 25649945  # Replace with your Telegram API ID
+API_HASH = "d91f3e307f5ee75e57136421f2c3adc6"  # Replace with your Telegram API Hash
 
 # List of admin user IDs (ganti dengan ID admin Anda)
 ADMIN_IDS = [5988451717]  # Replace with your actual admin Telegram user IDs
@@ -26,12 +31,20 @@ import subprocess
 import re
 import threading
 import shutil
+import sys
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
 
+# Telegram imports
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackContext, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram.constants import ParseMode
+
+# Telethon imports for sending videos
+from telethon import TelegramClient
+from telethon.tl.types import DocumentAttributeVideo
+import telethon.sync
 
 # Konfigurasi logging
 logging.basicConfig(
@@ -48,8 +61,14 @@ RECORDINGS_DIR.mkdir(exist_ok=True)
 FINISHED_RECORDINGS_DIR = Path("finished_recordings") 
 FINISHED_RECORDINGS_DIR.mkdir(exist_ok=True)
 
+TEMP_DIR = Path("temp")
+TEMP_DIR.mkdir(exist_ok=True)
+
 DB_FILE = Path("database.json")
 COOKIES_FILE = Path("cookies.json")
+
+# Initialize Telethon client
+telethon_client = TelegramClient('tiktok_recorder_session', API_ID, API_HASH)
 
 # Enum Mode
 class Mode:
@@ -133,6 +152,13 @@ def admin_only(func):
             return
         return await func(update, context)
     return wrapper
+
+# Format time duration
+def format_duration(seconds):
+    """Format duration in seconds to HH:MM:SS format"""
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
 
 # HTTP Client
 class HttpClient:
@@ -375,16 +401,14 @@ class VideoManagement:
             return file_path
     
     @staticmethod
-    def compress_video(input_file: str, target_size_mb: int = 45):
-        """Compress video to target size in MB while maintaining quality"""
-        logger.info(f"Compressing {input_file} to target size {target_size_mb}MB...")
-        
+    def get_video_info(input_file: str):
+        """Get video info using ffprobe"""
         try:
-            # Get original size and duration
+            # Get video info
             probe_cmd = [
                 "ffprobe", 
                 "-v", "error", 
-                "-show_entries", "format=duration,size", 
+                "-show_entries", "format=duration,size:stream=width,height,codec_type", 
                 "-of", "json", 
                 input_file
             ]
@@ -398,18 +422,67 @@ class VideoManagement:
             
             probe_data = json.loads(probe_result.stdout)
             duration = float(probe_data["format"]["duration"])
-            original_size = int(probe_data["format"]["size"])
-            original_size_mb = original_size / (1024 * 1024)
+            size_bytes = int(probe_data["format"]["size"])
             
-            # Calculate target bitrate (80% of ideal to account for overhead)
-            target_size_bytes = target_size_mb * 1024 * 1024 * 0.8
+            # Find video stream
+            video_stream = None
+            for stream in probe_data.get("streams", []):
+                if stream.get("codec_type") == "video":
+                    video_stream = stream
+                    break
+            
+            if video_stream:
+                width = int(video_stream.get("width", 0))
+                height = int(video_stream.get("height", 0))
+            else:
+                width = 0
+                height = 0
+            
+            return {
+                "duration": duration,
+                "size_bytes": size_bytes,
+                "width": width,
+                "height": height
+            }
+        except Exception as e:
+            logger.error(f"Error getting video info: {e}")
+            return {
+                "duration": 0,
+                "size_bytes": os.path.getsize(input_file) if os.path.exists(input_file) else 0,
+                "width": 0,
+                "height": 0
+            }
+    
+    @staticmethod
+    def compress_video(input_file: str, target_size_mb: int = 2000):
+        """Compress video to target size in MB while maintaining quality"""
+        logger.info(f"Compressing {input_file} to target size {target_size_mb}MB...")
+        
+        try:
+            # Get video info
+            video_info = VideoManagement.get_video_info(input_file)
+            duration = video_info["duration"]
+            original_size = video_info["size_bytes"]
+            original_size_mb = original_size / (1024 * 1024)
+            width = video_info["width"]
+            height = video_info["height"]
+            
+            # Calculate target bitrate (90% of ideal to account for overhead)
+            target_size_bytes = target_size_mb * 1024 * 1024 * 0.9
             target_bitrate = int((target_size_bytes * 8) / duration)
             
-            logger.info(f"Original size: {original_size_mb:.2f}MB, Duration: {duration:.2f}s")
-            logger.info(f"Using target bitrate: {target_bitrate/1000:.2f}kbps")
+            logger.info(f"Original: {original_size_mb:.2f}MB, Duration: {duration:.2f}s, Resolution: {width}x{height}")
+            logger.info(f"Target bitrate: {target_bitrate/1000:.2f}kbps")
             
             # Output file name
             output_file = input_file.replace('.mp4', f'_compressed_{target_size_mb}MB.mp4')
+            
+            # Adjust resolution if needed for better compression
+            resolution_args = []
+            if width > 1280 and height > 720:
+                # Scale down to 720p for better compression
+                resolution_args = ["-vf", "scale=1280:720"]
+                logger.info("Scaling down to 720p for better compression")
             
             # Compress with calculated bitrate
             compress_cmd = [
@@ -422,8 +495,14 @@ class VideoManagement:
                 "-preset", "medium",  # Balance between quality and speed
                 "-c:a", "aac",
                 "-b:a", "128k",
-                "-y", output_file
             ]
+            
+            # Add resolution args if needed
+            if resolution_args:
+                compress_cmd.extend(resolution_args)
+                
+            # Add output file
+            compress_cmd.extend(["-y", output_file])
             
             subprocess.run(compress_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             
@@ -432,6 +511,33 @@ class VideoManagement:
             compressed_size_mb = compressed_size / (1024 * 1024)
             
             logger.info(f"Compressed file size: {compressed_size_mb:.2f}MB")
+            
+            # If still too large, compress again with more aggressive settings
+            if compressed_size_mb > target_size_mb and target_size_mb < 1900:
+                logger.info("File still too large, trying more aggressive compression...")
+                os.remove(output_file)  # Remove the first attempt
+                
+                # Try more aggressive compression
+                more_aggressive_cmd = [
+                    "ffmpeg",
+                    "-i", input_file,
+                    "-c:v", "libx264",
+                    "-b:v", f"{target_bitrate * 0.6}",  # 60% of original target
+                    "-maxrate", f"{target_bitrate}",
+                    "-bufsize", f"{target_bitrate * 1.5}",
+                    "-preset", "medium",
+                    "-c:a", "aac",
+                    "-b:a", "96k",
+                    "-vf", "scale=960:540",  # Scale down more aggressively
+                    "-y", output_file
+                ]
+                
+                subprocess.run(more_aggressive_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                
+                # Check new size
+                compressed_size = os.path.getsize(output_file)
+                compressed_size_mb = compressed_size / (1024 * 1024)
+                logger.info(f"More aggressively compressed size: {compressed_size_mb:.2f}MB")
             
             return output_file
         except Exception as e:
@@ -580,7 +686,7 @@ class TikTokRecorder:
         # Send notification to admin users
         if self.context:
             for admin_id in ADMIN_IDS:
-                asyncio.run(self._send_recording_started_notification(admin_id))
+                asyncio.run_coroutine_threadsafe(self._send_recording_started_notification(admin_id), asyncio.get_event_loop())
         
         start_recording_time = datetime.now()
         recording_duration = 0
@@ -672,7 +778,7 @@ class TikTokRecorder:
         
         # Send to Telegram if enabled
         if self.use_telegram and self.context:
-            asyncio.run(self.send_to_telegram(output_mp4, recording_duration))
+            asyncio.run_coroutine_threadsafe(self.send_to_telegram(output_mp4, recording_duration), asyncio.get_event_loop())
             
         return output_mp4
             
@@ -697,13 +803,13 @@ class TikTokRecorder:
                      f"🆔 Room ID: `{self.room_id}`\n"
                      f"⏱️ Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                      f"📂 Output file: `{os.path.basename(self.output_file)}`",
-                parse_mode="Markdown"
+                parse_mode=ParseMode.MARKDOWN
             )
         except Exception as e:
             logger.error(f"Error sending start notification: {e}")
             
     async def send_to_telegram(self, file_path, recording_duration):
-        """Send recorded file to Telegram users"""
+        """Send recorded file to Telegram users using Telethon"""
         db = init_database()
         
         if self.user not in db["tracked_accounts"]:
@@ -713,9 +819,7 @@ class TikTokRecorder:
         account_info = db["tracked_accounts"][self.user]
         
         # Format duration
-        hours, remainder = divmod(recording_duration, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        duration_str = f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
+        duration_str = format_duration(recording_duration)
         
         # Get file size
         file_size_bytes = os.path.getsize(file_path)
@@ -723,15 +827,15 @@ class TikTokRecorder:
         
         logger.info(f"File size: {file_size_mb:.2f} MB")
         
-        # Compress if too large for Telegram (50MB)
-        max_size = 50 * 1024 * 1024
+        # Compress if too large (2GB limit for Telegram)
+        max_size = 2000 * 1024 * 1024  # 2GB in bytes
         compressed_file = None
         
         if file_size_bytes > max_size:
-            logger.info(f"File too large for Telegram. Compressing...")
+            logger.info(f"File too large for Telegram ({file_size_mb:.2f} MB). Compressing...")
             
             # Use smart compression to target size
-            compressed_file = VideoManagement.compress_video(file_path, 45)  # Target 45MB
+            compressed_file = VideoManagement.compress_video(file_path, 1900)  # Target ~1.9GB to be safe
             
             # Check compressed size
             compressed_size_bytes = os.path.getsize(compressed_file)
@@ -739,68 +843,88 @@ class TikTokRecorder:
             
             logger.info(f"Compressed file size: {compressed_size_mb:.2f} MB")
             
-            # If still too large, compress more aggressively
-            if compressed_size_bytes > max_size:
-                logger.info("Compressed file still too large. Compressing more aggressively...")
-                
-                more_compressed = VideoManagement.compress_video(file_path, 30)  # Target 30MB
-                
-                # Remove first compressed file
-                if os.path.exists(compressed_file):
-                    os.remove(compressed_file)
-                compressed_file = more_compressed
-                
-                # Check new size
-                compressed_size_bytes = os.path.getsize(compressed_file)
-                compressed_size_mb = compressed_size_bytes / (1024 * 1024)
-                
-                logger.info(f"More compressed file size: {compressed_size_mb:.2f} MB")
-                
+            send_file = compressed_file
+            send_size_mb = compressed_size_mb
+        else:
+            send_file = file_path
+            send_size_mb = file_size_mb
+        
+        # Get video info for Telethon
+        video_info = VideoManagement.get_video_info(send_file)
+        width = video_info["width"]
+        height = video_info["height"]
+        duration = video_info["duration"]
+        
+        # Prepare Telethon client if not already running
+        if not telethon_client.is_connected():
+            await telethon_client.connect()
+            if not await telethon_client.is_user_authorized():
+                logger.error("Telethon client not authorized. Please run the auth script first.")
+                # Fallback to bot API
+                await self._send_via_bot_api(send_file, send_size_mb)
+                return
+        
         # Send to all admin users
         for admin_id in ADMIN_IDS:
             try:
-                send_file = compressed_file if compressed_file else file_path
-                send_size = os.path.getsize(send_file) / (1024 * 1024)
-                
-                # Check if still too large
-                if os.path.getsize(send_file) > max_size:
-                    await self.context.bot.send_message(
-                        chat_id=admin_id,
-                        text=(
-                            f"⚠️ Recording of @{self.user}'s livestream is too large even "
-                            f"after compression ({send_size:.2f} MB).\n\n"
-                            f"File saved locally at: `{file_path}`"
-                        ),
-                        parse_mode="Markdown"
-                    )
-                    continue
-                    
-                # Send status message
+                # Notify admin with bot API first
                 status_msg = await self.context.bot.send_message(
                     chat_id=admin_id,
-                    text=f"📤 Sending{' compressed' if compressed_file else ''} recording of @{self.user}'s livestream ({send_size:.2f} MB)..."
+                    text=f"📤 Sending recording of @{self.user}'s livestream ({send_size_mb:.2f} MB)...\n"
+                         f"🕒 This may take a few minutes.",
+                    parse_mode=ParseMode.MARKDOWN
                 )
                 
-                # Send the file
-                await self.context.bot.send_document(
-                    chat_id=admin_id,
-                    document=open(send_file, 'rb'),
-                    caption=(
+                try:
+                    # Send with Telethon as a video
+                    caption = (
                         f"🎬 Recording of @{self.user}'s livestream\n\n"
                         f"🆔 Room ID: {self.room_id}\n"
                         f"⏱️ Duration: {duration_str}\n"
-                        f"📦 Size: {send_size:.2f} MB\n"
+                        f"📦 Size: {send_size_mb:.2f} MB\n"
                         f"🗓️ Recorded on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                         f"{' (compressed)' if compressed_file else ''}"
                     )
-                )
-                
-                # Update status
-                await self.context.bot.edit_message_text(
-                    text=f"✅ Recording of @{self.user}'s livestream sent successfully!",
-                    chat_id=admin_id,
-                    message_id=status_msg.message_id
-                )
+                    
+                    # Use attributes to ensure it's sent as a video
+                    attributes = [
+                        DocumentAttributeVideo(
+                            duration=int(duration),
+                            w=width,
+                            h=height,
+                            supports_streaming=True
+                        )
+                    ]
+                    
+                    # Send the video using Telethon
+                    await telethon_client.send_file(
+                        admin_id,
+                        file=send_file,
+                        caption=caption,
+                        attributes=attributes,
+                        supports_streaming=True
+                    )
+                    
+                    # Update status
+                    await self.context.bot.edit_message_text(
+                        text=f"✅ Recording of @{self.user}'s livestream sent successfully!",
+                        chat_id=admin_id,
+                        message_id=status_msg.message_id,
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    
+                except Exception as e:
+                    logger.error(f"Error sending with Telethon: {e}")
+                    
+                    # Fallback to bot API if Telethon fails
+                    await self.context.bot.edit_message_text(
+                        text=f"⚠️ Error with automatic video sending. Trying alternative method...",
+                        chat_id=admin_id,
+                        message_id=status_msg.message_id
+                    )
+                    
+                    # Fallback to bot API (will send as file not video)
+                    await self._send_via_bot_api(send_file, send_size_mb, admin_id)
                 
             except Exception as e:
                 logger.error(f"Error sending to admin {admin_id}: {e}")
@@ -808,14 +932,60 @@ class TikTokRecorder:
                 try:
                     await self.context.bot.send_message(
                         chat_id=admin_id,
-                        text=f"❌ Error sending the recording: {str(e)}"
+                        text=f"❌ Error sending the recording: {str(e)}",
+                        parse_mode=ParseMode.MARKDOWN
                     )
                 except:
                     pass
                     
         # Clean up compressed file
         if compressed_file and os.path.exists(compressed_file):
-            os.remove(compressed_file)
+            try:
+                os.remove(compressed_file)
+            except Exception as e:
+                logger.error(f"Error removing compressed file: {e}")
+    
+    async def _send_via_bot_api(self, file_path, file_size_mb, admin_id=None):
+        """Fallback method to send using Bot API"""
+        if admin_id is None:
+            # If no specific admin, send to all admins
+            admin_ids = ADMIN_IDS
+        else:
+            admin_ids = [admin_id]
+            
+        # Bot API limit is 50MB
+        if file_size_mb > 50:
+            for admin_id in admin_ids:
+                await self.context.bot.send_message(
+                    chat_id=admin_id,
+                    text=f"⚠️ File is too large for direct sending ({file_size_mb:.2f} MB). "
+                         f"The recording is saved locally at: `{file_path}`",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            return
+            
+        # Send as video with Bot API
+        for admin_id in admin_ids:
+            try:
+                with open(file_path, 'rb') as video_file:
+                    await self.context.bot.send_video(
+                        chat_id=admin_id,
+                        video=video_file,
+                        caption=(
+                            f"🎬 Recording of @{self.user}'s livestream\n\n"
+                            f"🆔 Room ID: {self.room_id}\n"
+                            f"📦 Size: {file_size_mb:.2f} MB\n"
+                            f"🗓️ Recorded on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                        ),
+                        supports_streaming=True
+                    )
+            except Exception as e:
+                logger.error(f"Error sending via Bot API: {e}")
+                await self.context.bot.send_message(
+                    chat_id=admin_id,
+                    text=f"❌ Could not send as video. File is saved at: `{file_path}`",
+                    parse_mode=ParseMode.MARKDOWN
+                )
 
 # Bot Helper Functions
 def ensure_user(db, user_id):
@@ -855,7 +1025,7 @@ async def add_account(update: Update, context: CallbackContext):
     cookies = init_cookies()
     api = TikTokAPI(cookies=cookies)
     
-    status_msg = await update.message.reply_text(f"🔍 Checking TikTok account...")
+    status_msg = await update.message.reply_text("🔍 Checking TikTok account...")
     
     try:
         username = ""
@@ -871,7 +1041,7 @@ async def add_account(update: Update, context: CallbackContext):
             room_id = api.get_room_id_from_user(username)
         
         if not username:
-            await status_msg.edit_text(f"❌ Could not find username from the provided input.")
+            await status_msg.edit_text("❌ Could not find username from the provided input.")
             return
             
         # Check if already tracking
@@ -1011,7 +1181,7 @@ async def list_accounts(update: Update, context: CallbackContext):
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text(account_list, parse_mode="Markdown", reply_markup=reply_markup)
+    await update.message.reply_text(account_list, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
 
 @admin_only
 async def check_account(update: Update, context: CallbackContext, username: str):
@@ -1067,14 +1237,14 @@ async def check_account(update: Update, context: CallbackContext, username: str)
                 f"🔴 @{username} is currently LIVE!\n"
                 f"📹 Already recording this livestream.\n"
                 f"🆔 Room ID: `{room_id}`",
-                parse_mode="Markdown"
+                parse_mode=ParseMode.MARKDOWN
             )
         else:
             await status_msg.edit_text(
                 f"🔴 @{username} is currently LIVE!\n"
                 f"📹 Starting to record this livestream...\n"
                 f"🆔 Room ID: `{room_id}`",
-                parse_mode="Markdown"
+                parse_mode=ParseMode.MARKDOWN
             )
             
             # Start the recording
@@ -1084,7 +1254,7 @@ async def check_account(update: Update, context: CallbackContext, username: str)
             f"⚫ @{username} is not currently live.\n"
             f"🆔 Room ID: `{room_id}`\n"
             f"⏱️ Last checked: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            parse_mode="Markdown"
+            parse_mode=ParseMode.MARKDOWN
         )
     
     return status_msg
@@ -1155,7 +1325,7 @@ async def check_all_accounts(update: Update, context: CallbackContext):
     live_status = f"🎉 {live_count} account(s) are currently live!" if live_count > 0 else "😴 None of your tracked accounts are currently live."
     await status_msg.edit_text(
         f"📊 Status of your tracked accounts:\n\n{results}\n{live_status}",
-        parse_mode="Markdown"
+        parse_mode=ParseMode.MARKDOWN
     )
 
 @admin_only
@@ -1207,9 +1377,9 @@ async def show_active_recordings(update: Update, context: CallbackContext):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     if hasattr(update, 'message') and update.message:
-        await update.message.reply_text(active_list, parse_mode="Markdown", reply_markup=reply_markup)
+        await update.message.reply_text(active_list, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
     else:
-        await update.callback_query.message.edit_text(active_list, parse_mode="Markdown", reply_markup=reply_markup)
+        await update.callback_query.message.edit_text(active_list, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
 
 @admin_only
 async def show_recordings_list(update: Update, context: CallbackContext):
@@ -1244,9 +1414,7 @@ async def show_recordings_list(update: Update, context: CallbackContext):
         size_mb = size_bytes / (1024 * 1024) if size_bytes else 0
         
         # Format duration
-        hours, remainder = divmod(duration, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        duration_str = f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
+        duration_str = format_duration(duration)
         
         # Format date
         end_time = recording.get("end_time", "")
@@ -1277,13 +1445,13 @@ async def show_recordings_list(update: Update, context: CallbackContext):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     if hasattr(update, 'message') and update.message:
-        await update.message.reply_text(recordings_list, parse_mode="Markdown", reply_markup=reply_markup)
+        await update.message.reply_text(recordings_list, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
     else:
-        await update.callback_query.message.edit_text(recordings_list, parse_mode="Markdown", reply_markup=reply_markup)
+        await update.callback_query.message.edit_text(recordings_list, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
 
 @admin_only
 async def send_recording(update: Update, context: CallbackContext, index: int):
-    """Send a specific recording to the user"""
+    """Send a specific recording to the user via Telethon"""
     query = update.callback_query
     user_id = query.from_user.id
     
@@ -1311,7 +1479,7 @@ async def send_recording(update: Update, context: CallbackContext, index: int):
     await query.answer("Preparing to send recording...")
     
     # Send a status message
-    status_msg = await query.message.reply_text("📤 Preparing to send recording. This may take a moment...")
+    status_msg = await query.message.reply_text("📤 Preparing to send recording as video. This may take a moment...")
     
     # Get recording details
     username = recording.get("username", "Unknown")
@@ -1321,9 +1489,7 @@ async def send_recording(update: Update, context: CallbackContext, index: int):
     size_mb = size_bytes / (1024 * 1024) if size_bytes else 0
     
     # Format duration
-    hours, remainder = divmod(duration, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    duration_str = f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
+    duration_str = format_duration(duration)
     
     # Format date
     end_time = recording.get("end_time", "")
@@ -1335,73 +1501,130 @@ async def send_recording(update: Update, context: CallbackContext, index: int):
         except:
             pass
     
-    # Check if file is too large
-    max_size = 50 * 1024 * 1024
-    if size_bytes > max_size:
-        # Try to compress
-        await status_msg.edit_text(f"📦 File is too large ({size_mb:.2f} MB). Compressing...")
+    try:
+        # Check if file is too large (2GB Telegram limit)
+        max_size = 2000 * 1024 * 1024
         
-        try:
-            compressed_file = VideoManagement.compress_video(file_path, 45)
+        if size_bytes > max_size:
+            # Try to compress
+            await status_msg.edit_text(f"📦 File is too large ({size_mb:.2f} MB). Compressing to under 2GB...")
+            
+            # Compress the video
+            compressed_file = VideoManagement.compress_video(file_path, 1900)  # Target ~1.9GB to be safe
+            
+            # Get the new file size
             compressed_size = os.path.getsize(compressed_file)
             compressed_size_mb = compressed_size / (1024 * 1024)
             
-            if compressed_size > max_size:
-                more_compressed = VideoManagement.compress_video(file_path, 30)
-                os.remove(compressed_file)
-                compressed_file = more_compressed
-                compressed_size = os.path.getsize(compressed_file)
-                compressed_size_mb = compressed_size / (1024 * 1024)
+            # Use the compressed file
+            send_file = compressed_file
+            send_size_mb = compressed_size_mb
             
-            if compressed_size > max_size:
-                await status_msg.edit_text(
-                    f"⚠️ File is still too large after compression ({compressed_size_mb:.2f} MB).\n"
-                    f"Maximum Telegram size is 50 MB."
-                )
-                return
-            
-            # Send the compressed file
             await status_msg.edit_text(f"📤 Sending compressed recording ({compressed_size_mb:.2f} MB)...")
+        else:
+            # Use original file
+            send_file = file_path
+            send_size_mb = size_mb
             
-            # Send the file
-            await context.bot.send_document(
-                chat_id=user_id,
-                document=open(compressed_file, 'rb'),
-                caption=(
-                    f"🎬 Recording of @{username}'s livestream\n\n"
-                    f"🆔 Room ID: {room_id}\n"
-                    f"⏱️ Duration: {duration_str}\n"
-                    f"📦 Size: {compressed_size_mb:.2f} MB (compressed)\n"
-                    f"🗓️ Recorded on: {date_str}"
-                )
-            )
-            
-            # Clean up
-            os.remove(compressed_file)
-            
-        except Exception as e:
-            logger.error(f"Error compressing file: {e}")
-            await status_msg.edit_text(f"❌ Error compressing file: {str(e)}")
-            return
-    else:
-        # Send directly
-        await status_msg.edit_text(f"📤 Sending recording ({size_mb:.2f} MB)...")
+            await status_msg.edit_text(f"📤 Sending recording ({size_mb:.2f} MB)...")
         
-        # Send the file
-        await context.bot.send_document(
-            chat_id=user_id,
-            document=open(file_path, 'rb'),
-            caption=(
-                f"🎬 Recording of @{username}'s livestream\n\n"
-                f"🆔 Room ID: {room_id}\n"
-                f"⏱️ Duration: {duration_str}\n"
-                f"📦 Size: {size_mb:.2f} MB\n"
-                f"🗓️ Recorded on: {date_str}"
-            )
+        # Get video info for Telethon
+        video_info = VideoManagement.get_video_info(send_file)
+        width = video_info["width"]
+        height = video_info["height"]
+        video_duration = video_info["duration"]
+        
+        # Prepare caption
+        caption = (
+            f"🎬 Recording of @{username}'s livestream\n\n"
+            f"🆔 Room ID: {room_id}\n"
+            f"⏱️ Duration: {duration_str}\n"
+            f"📦 Size: {send_size_mb:.2f} MB\n"
+            f"🗓️ Recorded on: {date_str}"
+            f"{' (compressed)' if size_bytes > max_size else ''}"
         )
-    
-    # Update status
-    await status_msg.edit_text("✅ Recording sent successfully!")
+        
+        # Make sure Telethon client is connected
+        if not telethon_client.is_connected():
+            await telethon_client.connect()
+            
+        # Check if authorized
+        if not await telethon_client.is_user_authorized():
+            # Fall back to Bot API
+            await status_msg.edit_text("⚠️ Telethon client not authorized. Using alternative method...")
+            
+            # Only try if under 50MB (Bot API limit)
+            if send_size_mb <= 50:
+                with open(send_file, "rb") as video_file:
+                    await context.bot.send_video(
+                        chat_id=user_id,
+                        video=video_file,
+                        caption=caption,
+                        supports_streaming=True
+                    )
+                    await status_msg.edit_text("✅ Recording sent successfully!")
+            else:
+                await status_msg.edit_text(
+                    f"❌ File is too large for Bot API ({send_size_mb:.2f} MB) and Telethon is not authorized.\n"
+                    f"File is available at: `{send_file}`",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+        else:
+            # Set up video attributes
+            attributes = [
+                DocumentAttributeVideo(
+                    duration=int(video_duration),
+                    w=width,
+                    h=height,
+                    supports_streaming=True
+                )
+            ]
+            
+            # Send via Telethon
+            await telethon_client.send_file(
+                user_id,
+                file=send_file,
+                caption=caption,
+                attributes=attributes,
+                supports_streaming=True
+            )
+            
+            # Update status message
+            await status_msg.edit_text("✅ Recording sent successfully as video!")
+            
+        # Clean up temporary file if we compressed
+        if size_bytes > max_size and send_file != file_path and os.path.exists(send_file):
+            os.remove(send_file)
+            
+    except Exception as e:
+        logger.error(f"Error sending recording: {e}")
+        
+        # Try fallback to Bot API if possible
+        try:
+            if send_size_mb <= 50:
+                await status_msg.edit_text(f"⚠️ Error sending video. Trying alternative method...")
+                
+                with open(send_file, "rb") as video_file:
+                    await context.bot.send_video(
+                        chat_id=user_id,
+                        video=video_file,
+                        caption=caption,
+                        supports_streaming=True
+                    )
+                    await status_msg.edit_text("✅ Recording sent successfully using alternative method!")
+            else:
+                await status_msg.edit_text(
+                    f"❌ Error sending the recording: {str(e)}\n"
+                    f"The file is available at: `{send_file}`",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+        except Exception as inner_e:
+            logger.error(f"Error in fallback sending: {inner_e}")
+            await status_msg.edit_text(
+                f"❌ Error sending the recording: {str(e)}\n"
+                f"The file is available at: `{send_file}`",
+                parse_mode=ParseMode.MARKDOWN
+            )
 
 async def start_recording_for_account(username: str, context: CallbackContext):
     """Start recording for a specific account"""
@@ -1460,7 +1683,7 @@ async def start_recording_for_account(username: str, context: CallbackContext):
                 f"🆔 Room ID: `{room_id}`\n"
                 f"📹 Recording started automatically."
             ),
-            parse_mode="Markdown"
+            parse_mode=ParseMode.MARKDOWN
         )
     
     # Start recording in a separate thread
@@ -1509,12 +1732,19 @@ def run_recording_thread(username, room_id, context):
                 account_info["last_error"] = str(e)
                 save_database(db)
                 
+                # Use the asyncio event loop to send notifications
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
                 # Notify admin users
                 for admin_id in ADMIN_IDS:
-                    asyncio.run(context.bot.send_message(
+                    loop.run_until_complete(context.bot.send_message(
                         chat_id=admin_id,
-                        text=f"❌ Error recording @{username}'s livestream: {str(e)}"
+                        text=f"❌ Error recording @{username}'s livestream: {str(e)}",
+                        parse_mode=ParseMode.MARKDOWN
                     ))
+                
+                loop.close()
     
     except Exception as e:
         logger.error(f"Thread error for {username}: {e}")
@@ -1632,8 +1862,8 @@ async def help_command(update: Update, context: CallbackContext):
         f"❓ /help - Show this help message\n\n"
         f"The bot automatically checks for livestreams based on your settings interval. "
         f"When a tracked account goes live, it will notify you and start recording. "
-        f"When the livestream ends, it will send you the recording.",
-        parse_mode="Markdown"
+        f"When the livestream ends, it will send you the recording as a video.",
+        parse_mode=ParseMode.MARKDOWN
     )
 
 @admin_only
@@ -1679,7 +1909,7 @@ async def settings_command(update: Update, context: CallbackContext):
         f"🗜️ Auto-compress large files: {'✅ ON' if settings.get('auto_compress', True) else '❌ OFF'}\n"
         f"⏱️ Check interval: {settings.get('check_interval', 5)} minutes\n\n"
         f"Select a setting to change:",
-        parse_mode="Markdown",
+        parse_mode=ParseMode.MARKDOWN,
         reply_markup=reply_markup
     )
 
@@ -1851,17 +2081,17 @@ async def text_handler(update: Update, context: CallbackContext):
     text = update.message.text.lower()
     
     if text.startswith("add "):
-        username = text.split(" ")[1].strip()
+        username = text.split(" ", 1)[1].strip()
         context.args = [username]
         await add_account(update, context)
     
     elif text.startswith("remove "):
-        username = text.split(" ")[1].strip()
+        username = text.split(" ", 1)[1].strip()
         context.args = [username]
         await remove_account(update, context)
     
     elif text.startswith("check "):
-        username = text.split(" ")[1].strip()
+        username = text.split(" ", 1)[1].strip()
         await check_account(update, context, username)
     
     elif text == "list":
@@ -1900,6 +2130,21 @@ async def setup_job_queue(application):
         name="check_accounts"
     )
 
+async def initialize_telethon():
+    """Initialize Telethon client"""
+    global telethon_client
+    
+    if not telethon_client.is_connected():
+        logger.info("Connecting Telethon client...")
+        await telethon_client.connect()
+        
+        if not await telethon_client.is_user_authorized():
+            logger.warning("Telethon client not authorized. Using Bot API as fallback.")
+        else:
+            logger.info("Telethon client authorized and ready.")
+    
+    return telethon_client
+
 def main():
     """Start the bot"""
     # Create the application and pass it your bot's token
@@ -1922,11 +2167,16 @@ def main():
     # Register text message handler
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     
-    # Set up job queue
+    # Set up job queue and initialize Telethon
     application.job_queue.run_once(lambda context: asyncio.create_task(setup_job_queue(application)), 0)
+    application.job_queue.run_once(lambda context: asyncio.create_task(initialize_telethon()), 0)
     
     logger.info("Starting bot...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
+    # Start Telethon client
+    telethon_client.start()
+    
+    # Run the bot
     main()
