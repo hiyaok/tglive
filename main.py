@@ -2557,14 +2557,22 @@ def main():
         # Register text message handler
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
         
-        # Define setup function that we'll run on startup
-        async def setup(app):
-            await setup_job_queue(app)
-            await check_active_recordings_on_startup(app)
+        # Create jobs directly through job queue instead of post_init
+        job_queue = application.job_queue
         
-        logger.info("Starting bot...")
-        # Start the application, passing our setup function to post_init
-        application.run_polling(allowed_updates=Update.ALL_TYPES, post_init=setup)
+        # Run the check_tracked_accounts_job after 30 seconds
+        job_queue.run_once(check_tracked_accounts_job, 30)
+        
+        # Set up the repeating job with default 5 minute interval
+        job_queue.run_repeating(
+            check_tracked_accounts_job,
+            interval=5 * 60,  # Default 5 minutes
+            first=10,
+            name="check_accounts"
+        )
+        
+        logger.info("Starting bot without post_init...")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
         
     except Exception as e:
         logger.error(f"Critical error in main function: {e}")
@@ -2574,14 +2582,13 @@ def main():
         # Try to restart the bot after a delay
         logger.info("Restarting bot in 10 seconds...")
         time.sleep(10)
-        # Use os.execl to restart the process
+        # Restart the process safely
         os.execl(sys.executable, sys.executable, *sys.argv)
 
-# Keep this part the same
 if __name__ == "__main__":
     # Initialize event loop for main thread
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     
     # Run the bot
-    main()  # Notice we're not using asyncio.run() anymore
+    main()
