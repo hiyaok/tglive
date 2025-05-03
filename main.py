@@ -234,16 +234,105 @@ def run_async(coro):
 
 def is_recording_active(username):
     """Check if there's an actual recording process running for this username"""
-    # Simple check: look for running ffmpeg processes for this username
     try:
         if os.name == 'nt':  # Windows
             output = subprocess.check_output(f'tasklist /FI "IMAGENAME eq ffmpeg.exe"', shell=True).decode()
             return username in output
         else:  # Linux/Mac
-            output = subprocess.check_output(f"ps aux | grep ffmpeg | grep {username}", shell=True).decode()
-            return len(output.strip().split('\n')) > 1  # More than just the grep process itself
-    except:
+            # Use more specific grep to avoid false positives
+            output = subprocess.check_output(f"ps aux | grep ffmpeg | grep {username} | grep -v grep", shell=True).decode()
+            return bool(output.strip())  # If any output, recording is active
+    except subprocess.CalledProcessError:
+        # This happens when grep doesn't find anything - not an error
+        return False
+    except Exception as e:
+        logger.error(f"Error checking recording status for {username}: {e}")
         return False  # If error, assume not recording
+
+async def check_active_recordings_on_startup(application):
+    """Setup job queue and check for any recordings that should be running"""
+    # Set up the regular check job first
+    await setup_job_queue(application)
+    
+    # Now check for any recordings that were active before restart
+    db = init_database()
+    
+    logger.info("Checking for active recordings after startup...")
+    
+    for username, account_info in db["tracked_accounts"].items():
+        # If marked as recording but process not running
+        if account_info.get("is_recording", False) and not is_recording_active(username):
+            logger.info(f"Found interrupted recording for {username}. Verifying live status...")
+            
+            try:
+                # Initialize API
+                cookies = init_cookies()
+                api = TikTokAPI(cookies=cookies)
+                
+                # Get room ID
+                room_id = account_info.get("room_id", "") or api.get_room_id_from_user(username)
+                
+                if not room_id:
+                    logger.error(f"Could not find room ID for {username}")
+                    # Update database to mark as not recording
+                    account_info["is_recording"] = False
+                    account_info["last_error"] = "Room ID not found after restart"
+                    save_database(db)
+                    continue
+                
+                # Check if still live
+                is_live = api.is_room_alive(room_id)
+                
+                if is_live:
+                    logger.info(f"{username} is still live. Restarting recording...")
+                    
+                    # Update room ID in case it changed
+                    account_info["room_id"] = room_id
+                    save_database(db)
+                    
+                    # Start recording in a new thread
+                    await start_recording_for_account(username, application)
+                    
+                    # Notify admins
+                    for admin_id in ADMIN_IDS:
+                        try:
+                            await application.bot.send_message(
+                                chat_id=admin_id,
+                                text=f"🔄 Bot restarted and found @{username} is still live!\n"
+                                     f"📹 Recording has been resumed automatically."
+                            )
+                        except Exception as e:
+                            logger.error(f"Error sending restart notification: {e}")
+                else:
+                    logger.info(f"{username} is no longer live. Updating status...")
+                    # Update database to mark as not recording and not live
+                    account_info["is_recording"] = False
+                    account_info["is_live"] = False
+                    account_info["last_error"] = "Stream ended while bot was down"
+                    save_database(db)
+                    
+                    # Notify admins
+                    for admin_id in ADMIN_IDS:
+                        try:
+                            await application.bot.send_message(
+                                chat_id=admin_id,
+                                text=f"ℹ️ Bot restarted and found @{username} is no longer live.\n"
+                                     f"📋 Recording status has been updated."
+                            )
+                        except Exception as e:
+                            logger.error(f"Error sending restart notification: {e}")
+            except Exception as e:
+                logger.error(f"Error checking {username} after restart: {e}")
+                # Update status to avoid stuck recordings
+                account_info["is_recording"] = False
+                account_info["last_error"] = f"Error after restart: {str(e)}"
+                save_database(db)
+    
+    # Schedule a check for all tracked accounts after startup
+    application.job_queue.run_once(check_tracked_accounts_job, 30)
+    
+    logger.info("Startup check complete")
+        
 
 # HTTP Client
 class HttpClient:
@@ -2432,6 +2521,9 @@ async def setup_job_queue(application):
         first=10,
         name="check_accounts"
     )
+    
+    logger.info(f"Job queue set up with check interval: {check_interval} minutes")
+    return job_queue
 
 def main():
     """Start the bot"""
@@ -2441,7 +2533,7 @@ def main():
         # Initialize Telethon first
         initialize_telethon()
         
-        # Start Telethon event loop di background
+        # Start Telethon event loop in background
         telethon_runner = TelethonLoopRunner()
         telethon_runner.start()
         
@@ -2465,8 +2557,8 @@ def main():
         # Register text message handler
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
         
-        # Set up job queue
-        application.job_queue.run_once(lambda context: asyncio.create_task(setup_job_queue(application)), 0)
+        # Properly set up job queue with post_init
+        application.post_init = check_active_recordings_on_startup
         
         logger.info("Starting bot...")
         application.run_polling(allowed_updates=Update.ALL_TYPES)
