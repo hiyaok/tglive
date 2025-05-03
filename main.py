@@ -1,4 +1,3 @@
-#
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -2184,7 +2183,6 @@ async def text_handler(update: Update, context: CallbackContext):
         
         elif text.startswith("check "):
             username = text.split(" ", 1)[1].strip()
-            await check_username = text.split(" ", 1)[1].strip()
             await check_account(update, context, username)
         
         elif text == "list":
