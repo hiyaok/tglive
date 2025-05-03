@@ -2525,23 +2525,25 @@ async def setup_job_queue(application):
 def start_telethon_client():
     """Initialize and start Telethon client in a separate thread"""
     global telethon_client, telethon_loop
-    
-    # Create a dedicated event loop for Telethon
+
+    async def init_client():
+        nonlocal telethon_client
+        telethon_client = TelegramClient('tiktok_recorder_session', API_ID, API_HASH, loop=telethon_loop)
+        await telethon_client.start()
+
+        if not await telethon_client.is_user_authorized():
+            logger.warning("Telethon client not authorized. Please run the auth script first.")
+        else:
+            logger.info("Telethon client connected and authorized successfully!")
+
+    # Create and set event loop for this thread
     telethon_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(telethon_loop)
-    
-    # Initialize Telethon client
-    telethon_client = TelegramClient('tiktok_recorder_session', API_ID, API_HASH, loop=telethon_loop)
-    
-    # Connect and check authorization
-    telethon_loop.run_until_complete(telethon_client.start())
-    
-    if not telethon_loop.run_until_complete(telethon_client.is_user_authorized()):
-        logger.warning("Telethon client not authorized. Please run the auth script first.")
-    else:
-        logger.info("Telethon client connected and authorized successfully!")
-    
-    # Run the event loop
+
+    # Run setup async function
+    telethon_loop.run_until_complete(init_client())
+
+    # Start the loop
     telethon_loop.run_forever()
 
 def main():
