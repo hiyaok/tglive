@@ -2522,36 +2522,6 @@ async def setup_job_queue(application):
         name="check_accounts"
     )
 
-async def init_bot():
-    """Initialize and start the bot"""
-    # Create the application
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    # Register command handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("add", add_account))
-    application.add_handler(CommandHandler("remove", remove_account))
-    application.add_handler(CommandHandler("list", list_accounts))
-    application.add_handler(CommandHandler("check", check_all_accounts))
-    application.add_handler(CommandHandler("settings", settings_command))
-    application.add_handler(CommandHandler("active", active_command))
-    application.add_handler(CommandHandler("recordings", recordings_command))
-    
-    # Register callback query handler
-    application.add_handler(CallbackQueryHandler(callback_handler))
-    
-    # Register text message handler
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    
-    # Check active recordings on startup
-    await check_active_recordings_on_startup(application)
-    
-    # Setup job queue properly
-    await setup_job_queue(application)
-    
-    return application
-
 def main():
     """Main function to start everything"""
     global telethon_client, telethon_loop
@@ -2574,17 +2544,56 @@ def main():
         telethon_runner.start()
         
         # Connect Telethon client
-        telethon_loop.run_until_complete(telethon_client.connect())
-        if not telethon_loop.run_until_complete(telethon_client.is_user_authorized()):
+        fut = asyncio.run_coroutine_threadsafe(telethon_client.connect(), telethon_loop)
+        fut.result()  # Wait for connection
+        
+        # Check authorization
+        fut = asyncio.run_coroutine_threadsafe(telethon_client.is_user_authorized(), telethon_loop)
+        if not fut.result():
             logger.warning("Telethon client not authorized. Please run the auth script first.")
         else:
             logger.info("Telethon client connected and authorized successfully!")
         
-        # Initialize and run the telegram bot in the main loop
-        logger.info("Starting bot...")
-        application = main_loop.run_until_complete(init_bot())
+        # Create the application
+        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         
-        # Start the bot
+        # Register command handlers
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("add", add_account))
+        application.add_handler(CommandHandler("remove", remove_account))
+        application.add_handler(CommandHandler("list", list_accounts))
+        application.add_handler(CommandHandler("check", check_all_accounts))
+        application.add_handler(CommandHandler("settings", settings_command))
+        application.add_handler(CommandHandler("active", active_command))
+        application.add_handler(CommandHandler("recordings", recordings_command))
+        
+        # Register callback query handler
+        application.add_handler(CallbackQueryHandler(callback_handler))
+        
+        # Register text message handler
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+        
+        # Schedule the check active recordings function to run once at startup
+        application.job_queue.run_once(
+            lambda context: asyncio.run_coroutine_threadsafe(
+                check_active_recordings_on_startup(application), 
+                main_loop
+            ),
+            0
+        )
+        
+        # Schedule the setup job queue function
+        application.job_queue.run_once(
+            lambda context: asyncio.run_coroutine_threadsafe(
+                setup_job_queue(application),
+                main_loop
+            ),
+            1
+        )
+        
+        # Start the bot - this will block until the bot is stopped
+        logger.info("Starting bot...")
         application.run_polling(allowed_updates=Update.ALL_TYPES)
         
     except Exception as e:
