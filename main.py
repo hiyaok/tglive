@@ -1,4 +1,5 @@
 #
+#
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -2527,7 +2528,7 @@ def start_telethon_client():
     global telethon_client, telethon_loop
 
     async def init_client():
-        nonlocal telethon_client
+        global telethon_client
         telethon_client = TelegramClient('tiktok_recorder_session', API_ID, API_HASH, loop=telethon_loop)
         await telethon_client.start()
 
@@ -2546,13 +2547,20 @@ def start_telethon_client():
     # Start the loop
     telethon_loop.run_forever()
 
+
 def main():
     """Start the bot"""
     try:
-        # Create the application and pass it your bot's token
+        from telegram import Update
+        from telegram.ext import (
+            Application, CommandHandler, MessageHandler,
+            filters, CallbackQueryHandler
+        )
+
+        # Buat Application instance
         application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        
-        # Register command handlers
+
+        # Tambahkan handler perintah
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("help", help_command))
         application.add_handler(CommandHandler("add", add_account))
@@ -2562,48 +2570,39 @@ def main():
         application.add_handler(CommandHandler("settings", settings_command))
         application.add_handler(CommandHandler("active", active_command))
         application.add_handler(CommandHandler("recordings", recordings_command))
-        
-        # Register callback query handler
+
+        # Callback & text handler
         application.add_handler(CallbackQueryHandler(callback_handler))
-        
-        # Register text message handler
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-        
-        # Set up job queue and initialize Telethon
+
+        # Job queue setup
         application.job_queue.run_once(lambda context: asyncio.create_task(setup_job_queue(application)), 0)
-        
-        # Check for active recordings at startup
         application.job_queue.run_once(lambda context: asyncio.create_task(check_active_recordings_on_startup(application)), 1)
-        
+
         logger.info("Starting bot...")
         application.run_polling(allowed_updates=Update.ALL_TYPES)
     except Exception as e:
         logger.error(f"Critical error in main function: {e}")
-        # Try to restart the bot after a delay
         logger.info("Restarting bot in 10 seconds...")
         time.sleep(10)
         main()
 
+
 if __name__ == "__main__":
-    # Initialize event loop for main thread
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    
-    # Ensure the main event loop is set
+
     try:
         loop = asyncio.get_event_loop()
         if loop.is_closed():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
     except RuntimeError:
-        # If no event loop exists, create a new one
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-    
-    # Start Telethon client in a separate thread to avoid conflicts with bot
+
     telethon_thread = threading.Thread(target=start_telethon_client)
     telethon_thread.daemon = True
     telethon_thread.start()
-    
-    # Run the bot
+
     main()
