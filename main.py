@@ -33,6 +33,8 @@ import subprocess
 import re
 import threading
 import shutil
+# Tambahkan import ini di bagian atas file, bersama import-import lain
+import concurrent.futures
 import sys
 from pathlib import Path
 from datetime import datetime
