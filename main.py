@@ -131,40 +131,52 @@ def telethon_worker():
     while telethon_worker_running:
         try:
             # Ambil tugas dari queue dengan timeout (biar bisa keluar dari loop jika perlu)
-            task = telethon_task_queue.get(timeout=1.0)
+            try:
+                task = telethon_task_queue.get(timeout=1.0)
+            except queue.Empty:
+                # Queue kosong, lanjut ke iterasi berikutnya
+                time.sleep(0.5)
+                continue
             
             if task["type"] == "send_file":
                 # Jika tugasnya untuk mengirim file
                 logger.info(f"Processing send_file task to user {task['user_id']}")
                 
                 try:
-                    # Run coroutine in telethon_loop
-                    future = asyncio.run_coroutine_threadsafe(
-                        telethon_client.send_file(
-                            task["user_id"],
-                            file=task["file_path"],
-                            caption=task["caption"],
-                            attributes=task["attributes"],
-                            supports_streaming=True
-                        ),
-                        telethon_loop
-                    )
+                    # Create an async function for this task
+                    async def send_file_task():
+                        try:
+                            result = await telethon_client.send_file(
+                                task["user_id"],
+                                file=task["file_path"],
+                                caption=task["caption"],
+                                attributes=task["attributes"],
+                                supports_streaming=True
+                            )
+                            return True, None
+                        except Exception as e:
+                            logger.error(f"Error in send_file_task: {e}")
+                            return False, str(e)
                     
-                    # Tunggu hasil dengan timeout
-                    future.result(timeout=600)  # 10 menit timeout
+                    # Execute in the Telethon's event loop and wait for result
+                    future = asyncio.run_coroutine_threadsafe(send_file_task(), telethon_loop)
+                    success, error = future.result(timeout=600)  # 10 minutes timeout
                     
-                    # Kirim hasil sukses ke result queue
+                    # Process the result
                     telethon_result_queue.put({
                         "task_id": task["task_id"],
-                        "success": True,
-                        "error": None
+                        "success": success,
+                        "error": error
                     })
                     
-                    logger.info(f"Task {task['task_id']} completed successfully")
+                    if success:
+                        logger.info(f"Task {task['task_id']} completed successfully")
+                    else:
+                        logger.error(f"Task {task['task_id']} failed: {error}")
                     
                 except Exception as e:
-                    # Kirim hasil error ke result queue
-                    logger.error(f"Error in telethon task {task['task_id']}: {e}")
+                    # Handle any exception in the process
+                    logger.error(f"Error executing task {task['task_id']}: {e}")
                     telethon_result_queue.put({
                         "task_id": task["task_id"],
                         "success": False,
@@ -174,9 +186,6 @@ def telethon_worker():
             # Tandai tugas sudah selesai
             telethon_task_queue.task_done()
             
-        except queue.Empty:
-            # Queue kosong, lanjut ke iterasi berikutnya
-            pass
         except Exception as e:
             logger.error(f"Error in telethon worker: {e}")
     
