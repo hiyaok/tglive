@@ -1452,8 +1452,16 @@ async def list_accounts(update: Update, context: CallbackContext, page: int = 0)
         is_recording = "📹 Recording..." if account_info.get("is_recording", False) else ""
         room_id = account_info.get("room_id", "N/A")
         
-        account_list += f"@{username} - {is_live} {is_recording}\n"
-        account_list += f"  └ Room ID: {room_id}\n"
+        # Escape markdown characters in username and room_id
+        username_escaped = username.replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("]", "\\]").replace("`", "\\`")
+        
+        if isinstance(room_id, str):
+            room_id_escaped = room_id.replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("]", "\\]").replace("`", "\\`")
+        else:
+            room_id_escaped = room_id
+        
+        account_list += f"@{username_escaped} - {is_live} {is_recording}\n"
+        account_list += f"  └ Room ID: {room_id_escaped}\n"
     
     account_list += f"\nShowing {start_idx+1}-{end_idx} of {total_accounts} accounts"
     
@@ -1499,10 +1507,21 @@ async def list_accounts(update: Update, context: CallbackContext, page: int = 0)
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    if hasattr(update, 'message') and update.message:
-        await update.message.reply_text(account_list, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
-    else:
-        await update.callback_query.edit_message_text(account_list, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+    try:
+        if hasattr(update, 'message') and update.message:
+            await update.message.reply_text(account_list, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+        else:
+            await update.callback_query.edit_message_text(account_list, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+    except telegram.error.BadRequest as e:
+        logger.error(f"Error sending message with Markdown: {e}")
+        
+        # Try without Markdown formatting
+        plain_message = account_list.replace("*", "").replace("_", "").replace("`", "").replace("\\", "")
+        
+        if hasattr(update, 'message') and update.message:
+            await update.message.reply_text(plain_message, reply_markup=reply_markup)
+        else:
+            await update.callback_query.edit_message_text(plain_message, reply_markup=reply_markup)
 
 async def check_account(update: Update, context: CallbackContext, username: str):
     """Check if a TikTok account is currently live"""
