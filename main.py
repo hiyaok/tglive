@@ -1,5 +1,6 @@
 #
 #
+#
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -36,6 +37,7 @@ import shutil
 # Tambahkan import ini di bagian atas file, bersama import-import lain
 import concurrent.futures
 import sys
+import queue
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
@@ -75,6 +77,11 @@ COOKIES_FILE = Path("cookies.json")
 # Initialize Telethon client
 telethon_client = None
 telethon_loop = None
+# Tambahkan kode ini di level global, di dekat variabel telethon_client dan telethon_loop
+telethon_task_queue = queue.Queue()
+telethon_result_queue = queue.Queue()
+telethon_worker_thread = None
+telethon_worker_running = False
 
 # Class buat handle Telethon loop di background
 class TelethonLoopRunner:
@@ -113,6 +120,137 @@ def run_in_telethon_loop(coro):
         # Kalau dari thread lain, jadwalkan ke telethon_loop
         future = asyncio.run_coroutine_threadsafe(coro, telethon_loop)
         return future.result(timeout=180)  # 3 menit timeout untuk handle file gede
+
+def telethon_worker():
+    """Worker thread untuk menangani tugas Telethon"""
+    global telethon_worker_running, telethon_client, telethon_loop
+    
+    logger.info("Telethon worker thread started")
+    telethon_worker_running = True
+    
+    while telethon_worker_running:
+        try:
+            # Ambil tugas dari queue dengan timeout (biar bisa keluar dari loop jika perlu)
+            task = telethon_task_queue.get(timeout=1.0)
+            
+            if task["type"] == "send_file":
+                # Jika tugasnya untuk mengirim file
+                logger.info(f"Processing send_file task to user {task['user_id']}")
+                
+                try:
+                    # Run coroutine in telethon_loop
+                    future = asyncio.run_coroutine_threadsafe(
+                        telethon_client.send_file(
+                            task["user_id"],
+                            file=task["file_path"],
+                            caption=task["caption"],
+                            attributes=task["attributes"],
+                            supports_streaming=True
+                        ),
+                        telethon_loop
+                    )
+                    
+                    # Tunggu hasil dengan timeout
+                    future.result(timeout=600)  # 10 menit timeout
+                    
+                    # Kirim hasil sukses ke result queue
+                    telethon_result_queue.put({
+                        "task_id": task["task_id"],
+                        "success": True,
+                        "error": None
+                    })
+                    
+                    logger.info(f"Task {task['task_id']} completed successfully")
+                    
+                except Exception as e:
+                    # Kirim hasil error ke result queue
+                    logger.error(f"Error in telethon task {task['task_id']}: {e}")
+                    telethon_result_queue.put({
+                        "task_id": task["task_id"],
+                        "success": False,
+                        "error": str(e)
+                    })
+            
+            # Tandai tugas sudah selesai
+            telethon_task_queue.task_done()
+            
+        except queue.Empty:
+            # Queue kosong, lanjut ke iterasi berikutnya
+            pass
+        except Exception as e:
+            logger.error(f"Error in telethon worker: {e}")
+    
+    logger.info("Telethon worker thread stopping")
+
+# Fungsi untuk memulai worker thread jika belum berjalan
+def ensure_telethon_worker():
+    """Pastikan worker thread untuk Telethon berjalan"""
+    global telethon_worker_thread, telethon_worker_running
+    
+    if telethon_worker_thread is None or not telethon_worker_thread.is_alive():
+        logger.info("Starting new Telethon worker thread")
+        telethon_worker_running = True
+        telethon_worker_thread = threading.Thread(target=telethon_worker, daemon=True)
+        telethon_worker_thread.start()
+
+# Fungsi untuk mengantri tugas pengiriman file dan menunggu hasilnya
+async def queue_telethon_send_file(user_id, file_path, caption, attributes):
+    """Mengantri tugas pengiriman file via Telethon dan menunggu hasilnya"""
+    # Pastikan worker thread berjalan
+    ensure_telethon_worker()
+    
+    # Buat ID tugas unik
+    task_id = f"task_{int(time.time())}_{hash(file_path)}"
+    
+    # Buat tugas
+    task = {
+        "type": "send_file",
+        "task_id": task_id,
+        "user_id": user_id,
+        "file_path": file_path,
+        "caption": caption,
+        "attributes": attributes
+    }
+    
+    # Masukkan tugas ke dalam queue
+    telethon_task_queue.put(task)
+    logger.info(f"Queued task {task_id} for user {user_id}")
+    
+    # Tunggu hasil (dengan timeout) menggunakan asyncio untuk tidak memblokir
+    start_time = time.time()
+    max_wait_time = 600  # 10 menit timeout
+    
+    while (time.time() - start_time) < max_wait_time:
+        # Cek result queue
+        try:
+            # Gunakan loop kecil untuk cek result queue non-blocking
+            for _ in range(10):  # Coba beberapa kali
+                try:
+                    result = telethon_result_queue.get_nowait()
+                    
+                    # Cek apakah ini hasil untuk tugas kita
+                    if result["task_id"] == task_id:
+                        telethon_result_queue.task_done()
+                        logger.info(f"Got result for task {task_id}: success={result['success']}")
+                        return result["success"], result.get("error")
+                    else:
+                        # Bukan hasil kita, kembalikan ke queue
+                        telethon_result_queue.put(result)
+                        telethon_result_queue.task_done()
+                except queue.Empty:
+                    # Queue kosong, lanjut
+                    break
+            
+            # Tunggu sebentar sebelum cek lagi
+            await asyncio.sleep(1.0)
+            
+        except Exception as e:
+            logger.error(f"Error checking result for task {task_id}: {e}")
+            return False, str(e)
+    
+    # Timeout
+    logger.error(f"Timeout waiting for task {task_id}")
+    return False, "Timeout waiting for Telethon task to complete"
 
 def initialize_telethon():
     global telethon_client, telethon_loop
@@ -1809,7 +1947,6 @@ async def send_recording(update: Update, context: CallbackContext, index: int):
         # Check Telethon connection with improved error handling
         is_authorized = False
         try:
-            # PENTING: JANGAN coba connect Telethon di sini, gunakan runner yang sudah ada
             # Cukup cek apakah client sudah connected dan authorized
             if telethon_client and telethon_client.is_connected():
                 is_authorized = await telethon_client.is_user_authorized()
@@ -1824,65 +1961,36 @@ async def send_recording(update: Update, context: CallbackContext, index: int):
             try:
                 logger.info(f"Sending file to {user_id} via Telethon...")
                 
-                def send_with_telethon():
-                    global telethon_loop, telethon_client
-                    # Bikin future untuk ngirim file
-                    if telethon_loop and not telethon_loop.is_closed():
-                        # Set up video attributes
-                        attributes = [
-                            DocumentAttributeVideo(
-                                duration=int(video_duration),
-                                w=width,
-                                h=height,
-                                supports_streaming=True
-                            )
-                        ]
-                        
-                        # Create task in telethon_loop
-                        future = asyncio.run_coroutine_threadsafe(
-                            telethon_client.send_file(
-                                user_id,
-                                file=send_file,
-                                caption=caption,
-                                attributes=attributes,
-                                supports_streaming=True
-                            ),
-                            telethon_loop
-                        )
-                        
-                        # Wait for result with timeout
-                        try:
-                            future.result(timeout=600)  # 10 menit timeout
-                            return True
-                        except Exception as e:
-                            logger.error(f"Error executing Telethon future: {e}")
-                            return False
-                    else:
-                        logger.error("Telethon loop is closed or None")
-                        return False
+                # Setup video attributes
+                attributes = [
+                    DocumentAttributeVideo(
+                        duration=int(video_duration),
+                        w=width,
+                        h=height,
+                        supports_streaming=True
+                    )
+                ]
                 
-                # Execute in a separate thread to avoid event loop issues
-                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                send_success = await asyncio.get_event_loop().run_in_executor(executor, send_with_telethon)
-                executor.shutdown(wait=False)
+                # Use our new queue mechanism
+                success, error = await queue_telethon_send_file(
+                    user_id,
+                    send_file,
+                    caption,
+                    attributes
+                )
                 
-                if send_success:
+                if success:
+                    send_success = True
                     logger.info(f"Successfully sent video to {user_id} via Telethon")
                     
                     # Update status message
                     await status_msg.edit_text("✅ Recording sent successfully as video!")
                 else:
-                    logger.error("Failed to send via Telethon")
-                    await status_msg.edit_text(f"⚠️ Error with Telethon. Trying alternative method...")
+                    logger.error(f"Error from queue_telethon_send_file: {error}")
+                    await status_msg.edit_text(f"⚠️ Error with Telethon: {error}. Trying alternative method...")
                 
             except Exception as e:
                 logger.error(f"Error sending with Telethon: {e}")
-                
-                # Detailed error logging
-                if "Too large" in str(e):
-                    logger.error(f"File too large for Telethon (max 2GB)")
-                elif "flood wait" in str(e).lower() or "420" in str(e):
-                    logger.error(f"Telethon flood wait error. Backing off.")
                 
                 # Update status about error, but don't break yet - will try fallback
                 await status_msg.edit_text(f"⚠️ Error with Telethon: {str(e)}. Trying alternative method...")
@@ -1895,7 +2003,7 @@ async def send_recording(update: Update, context: CallbackContext, index: int):
                 # For files under 20MB, try sending as video for better playback
                 if send_size_mb <= 20:
                     with open(send_file, 'rb') as video_file:
-                        # REMOVED timeout parameter as it's not supported in your PTB version
+                        # REMOVED timeout parameter as it's not supported
                         await context.bot.send_video(
                             chat_id=user_id,
                             video=video_file,
@@ -1905,7 +2013,7 @@ async def send_recording(update: Update, context: CallbackContext, index: int):
                 else:
                     # For files 20-50MB, send as document which is more reliable
                     with open(send_file, 'rb') as video_file:
-                        # REMOVED timeout parameter 
+                        # REMOVED timeout parameter
                         await context.bot.send_document(
                             chat_id=user_id,
                             document=video_file,
@@ -1942,11 +2050,10 @@ async def send_recording(update: Update, context: CallbackContext, index: int):
             f"The file is available at: {os.path.basename(file_path)}"
         )
 
-
 # Fix untuk send_to_telegram function pada TikTokRecorder
 async def send_to_telegram(self, file_path, recording_duration):
     """Send recorded file to Telegram users using Telethon"""
-    global telethon_client, telethon_loop
+    global telethon_client
     
     db = init_database()
     
@@ -2032,48 +2139,26 @@ async def send_to_telegram(self, file_path, recording_duration):
                 try:
                     logger.info(f"Sending file to {admin_id} via Telethon...")
                     
-                    # Gunakan ThreadPoolExecutor agar tidak mengubah event loop
-                    def send_with_telethon():
-                        if telethon_loop and not telethon_loop.is_closed():
-                            # Use attributes to ensure it's sent as a video
-                            attributes = [
-                                DocumentAttributeVideo(
-                                    duration=int(duration) if duration else 0,
-                                    w=width if width else 1280,
-                                    h=height if height else 720,
-                                    supports_streaming=True
-                                )
-                            ]
-                            
-                            # Create future in telethon_loop
-                            future = asyncio.run_coroutine_threadsafe(
-                                telethon_client.send_file(
-                                    admin_id,
-                                    file=send_file,
-                                    caption=caption,
-                                    attributes=attributes,
-                                    supports_streaming=True
-                                ),
-                                telethon_loop
-                            )
-                            
-                            # Wait for result with timeout
-                            try:
-                                future.result(timeout=600)  # 10 minute timeout for large files
-                                return True
-                            except Exception as e:
-                                logger.error(f"Error executing Telethon future: {e}")
-                                return False
-                        else:
-                            logger.error("Telethon loop is closed or None")
-                            return False
+                    # Setup video attributes
+                    attributes = [
+                        DocumentAttributeVideo(
+                            duration=int(duration) if duration else 0,
+                            w=width if width else 1280,
+                            h=height if height else 720,
+                            supports_streaming=True
+                        )
+                    ]
                     
-                    # Run in executor to avoid event loop issues
-                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                    send_success = await asyncio.get_event_loop().run_in_executor(executor, send_with_telethon)
-                    executor.shutdown(wait=False)
+                    # Use our new queue mechanism
+                    success, error = await queue_telethon_send_file(
+                        admin_id,
+                        send_file,
+                        caption,
+                        attributes
+                    )
                     
-                    if send_success:
+                    if success:
+                        send_success = True
                         logger.info(f"Successfully sent video to {admin_id} via Telethon")
                         
                         # Update status
@@ -2083,15 +2168,15 @@ async def send_to_telegram(self, file_path, recording_duration):
                             message_id=status_msg.message_id
                         )
                     else:
-                        logger.error("Failed to send via Telethon")
+                        logger.error(f"Error from queue_telethon_send_file: {error}")
                         await self.context.bot.edit_message_text(
-                            text=f"⚠️ Error with Telethon. Trying alternative method...",
+                            text=f"⚠️ Error with Telethon: {error}. Trying alternative method...",
                             chat_id=admin_id,
                             message_id=status_msg.message_id
                         )
                     
                 except Exception as e:
-                    logger.error(f"Error sending with Telethon: {e}")
+                    logger.error(f"Error setting up Telethon send: {e}")
                     
                     # Update status about error, but don't break yet - will try fallback
                     await self.context.bot.edit_message_text(
@@ -2741,7 +2826,6 @@ def start_telethon_client():
     # Start the loop
     telethon_loop.run_forever()
 
-
 def main():
     """Start the bot"""
     try:
@@ -2798,5 +2882,5 @@ if __name__ == "__main__":
     telethon_thread = threading.Thread(target=start_telethon_client)
     telethon_thread.daemon = True
     telethon_thread.start()
-
+    
     main()
