@@ -1,4 +1,5 @@
 #
+#
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -1036,214 +1037,6 @@ class TikTokRecorder:
                 
             except Exception as fallback_e:
                 logger.error(f"Fallback notification also failed: {fallback_e}")
-    
-    async def send_to_telegram(self, file_path, recording_duration):
-        """Send recorded file to Telegram users using Telethon"""
-        global telethon_client
-        
-        db = init_database()
-        
-        if self.user not in db["tracked_accounts"]:
-            logger.error(f"Account {self.user} not found in tracked_accounts")
-            return
-            
-        account_info = db["tracked_accounts"][self.user]
-        
-        # Format duration
-        duration_str = format_duration(recording_duration)
-        
-        # Get file size
-        file_size_bytes = os.path.getsize(file_path)
-        file_size_mb = file_size_bytes / (1024 * 1024)
-        
-        logger.info(f"File size: {file_size_mb:.2f} MB")
-        
-        # Compress if too large (2GB limit for Telegram)
-        max_size = 2000 * 1024 * 1024  # 2GB in bytes
-        compressed_file = None
-        
-        if file_size_bytes > max_size:
-            logger.info(f"File too large for Telegram ({file_size_mb:.2f} MB). Compressing...")
-            
-            # Use smart compression to target size
-            compressed_file = VideoManagement.compress_video(file_path, 1900)  # Target ~1.9GB
-            
-            # Check compressed size
-            compressed_size_bytes = os.path.getsize(compressed_file)
-            compressed_size_mb = compressed_size_bytes / (1024 * 1024)
-            
-            logger.info(f"Compressed file size: {compressed_size_mb:.2f} MB")
-            
-            send_file = compressed_file
-            send_size_mb = compressed_size_mb
-        else:
-            send_file = file_path
-            send_size_mb = file_size_mb
-        
-        # Get video info for Telethon
-        video_info = VideoManagement.get_video_info(send_file)
-        width = video_info["width"]
-        height = video_info["height"]
-        duration = video_info["duration"]
-        
-        # Ensure Telethon client is connected - improved connection check
-        try:
-            if not telethon_client or not telethon_client.is_connected():
-                logger.info("Telethon client not connected. Attempting to reconnect...")
-                if telethon_client:
-                    await telethon_client.connect()
-                else:
-                    logger.error("Telethon client is None. Cannot reconnect.")
-                    is_authorized = False
-            else:
-                is_authorized = await telethon_client.is_user_authorized()
-        except Exception as e:
-            logger.error(f"Error checking Telethon connection: {e}")
-            is_authorized = False
-        
-        # Send to all admin users
-        for admin_id in ADMIN_IDS:
-            try:
-                # Notify admin with bot API first
-                status_msg = await self.context.bot.send_message(
-                    chat_id=admin_id,
-                    text=f"📤 Sending recording of @{self.user}'s livestream ({send_size_mb:.2f} MB)...\n"
-                         f"🕒 This may take a few minutes."
-                )
-                
-                # Prepare caption - same for all methods
-                caption = (
-                    f"🎬 Recording of @{self.user}'s livestream\n\n"
-                    f"🆔 Room ID: {self.room_id}\n"
-                    f"⏱️ Duration: {duration_str}\n"
-                    f"📦 Size: {send_size_mb:.2f} MB\n"
-                    f"🗓️ Recorded on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                    f"{' (compressed)' if compressed_file else ''}"
-                )
-                
-                # Enhanced send logic with better fallback handling
-                send_success = False
-                
-                # Try Telethon first if authorized
-                if is_authorized:
-                    try:
-                        logger.info(f"Sending file to {admin_id} via Telethon...")
-                        
-                        # Use attributes to ensure it's sent as a video
-                        attributes = [
-                            DocumentAttributeVideo(
-                                duration=int(duration) if duration else 0,
-                                w=width if width else 1280,
-                                h=height if height else 720,
-                                supports_streaming=True
-                            )
-                        ]
-                        
-                        # Send with timeout to prevent hanging
-                        await asyncio.wait_for(
-                            telethon_client.send_file(
-                                admin_id,
-                                file=send_file,
-                                caption=caption,
-                                attributes=attributes,
-                                supports_streaming=True
-                            ), 
-                            timeout=600  # 10 minute timeout for large files
-                        )
-                        
-                        send_success = True
-                        logger.info(f"Successfully sent video to {admin_id} via Telethon")
-                        
-                        # Update status
-                        await self.context.bot.edit_message_text(
-                            text=f"✅ Recording of @{self.user}'s livestream sent successfully!",
-                            chat_id=admin_id,
-                            message_id=status_msg.message_id
-                        )
-                        
-                    except Exception as e:
-                        logger.error(f"Error sending with Telethon: {e}")
-                        
-                        # Detailed error logging
-                        if "Too large" in str(e):
-                            logger.error(f"File too large for Telethon (max 2GB)")
-                        elif "flood wait" in str(e).lower() or "420" in str(e):
-                            logger.error(f"Telethon flood wait error. Backing off.")
-                        
-                        # Update status about error, but don't break yet - will try fallback
-                        await self.context.bot.edit_message_text(
-                            text=f"⚠️ Error with Telethon: {str(e)}. Trying alternative method...",
-                            chat_id=admin_id,
-                            message_id=status_msg.message_id
-                        )
-                
-                # If Telethon failed or not available, try Bot API for small files
-                if not send_success and send_size_mb <= 50:
-                    try:
-                        logger.info(f"Sending file to {admin_id} via Bot API...")
-                        
-                        # For files under 20MB, try sending as video for better playback
-                        if send_size_mb <= 20:
-                            with open(send_file, 'rb') as video_file:
-                                await self.context.bot.send_video(
-                                    chat_id=admin_id,
-                                    video=video_file,
-                                    caption=caption,
-                                    supports_streaming=True,
-                                    timeout=300  # 5 minute timeout
-                                )
-                        else:
-                            # For files 20-50MB, send as document which is more reliable
-                            with open(send_file, 'rb') as video_file:
-                                await self.context.bot.send_document(
-                                    chat_id=admin_id,
-                                    document=video_file,
-                                    caption=caption,
-                                    timeout=300  # 5 minute timeout
-                                )
-                        
-                        send_success = True
-                        logger.info(f"Successfully sent video to {admin_id} via Bot API")
-                        
-                        # Update status
-                        await self.context.bot.edit_message_text(
-                            text=f"✅ Recording of @{self.user}'s livestream sent successfully via Bot API!",
-                            chat_id=admin_id,
-                            message_id=status_msg.message_id
-                        )
-                        
-                    except Exception as e:
-                        logger.error(f"Error sending with Bot API: {e}")
-                        send_success = False
-                
-                # If all methods failed, send file path info
-                if not send_success:
-                    await self.context.bot.edit_message_text(
-                        text=f"❌ Could not send recording automatically. Recording saved at: {os.path.basename(send_file)}",
-                        chat_id=admin_id,
-                        message_id=status_msg.message_id
-                    )
-                    
-            except Exception as e:
-                logger.error(f"Error in admin notification process for {admin_id}: {e}")
-                
-                # Final fallback - try to notify admin about the error
-                try:
-                    await self.context.bot.send_message(
-                        chat_id=admin_id,
-                        text=f"❌ Error sending the recording: {str(e)}\n"
-                             f"Recording is saved at: {os.path.basename(send_file)}"
-                    )
-                except:
-                    # If even this fails, log but continue to other admins
-                    logger.error(f"Complete failure to notify admin {admin_id}")
-        
-        # Clean up compressed file
-        if compressed_file and os.path.exists(compressed_file):
-            try:
-                os.remove(compressed_file)
-            except Exception as e:
-                logger.error(f"Error removing compressed file: {e}")
 
     async def _send_via_bot_api(self, file_path, file_size_mb, admin_id=None):
         """Fallback method to send using Bot API"""
@@ -1907,6 +1700,7 @@ async def show_recordings_list(update: Update, context: CallbackContext, page: i
         else:
             await update.callback_query.edit_message_text(plain_message, reply_markup=reply_markup)
 
+# Fix untuk send_recording function
 async def send_recording(update: Update, context: CallbackContext, index: int):
     """Send a specific recording to the user via Telethon"""
     global telethon_client
@@ -2011,52 +1805,73 @@ async def send_recording(update: Update, context: CallbackContext, index: int):
         send_success = False
         
         # Check Telethon connection with improved error handling
+        is_authorized = False
         try:
-            if not telethon_client or not telethon_client.is_connected():
-                logger.info("Telethon client not connected. Attempting to reconnect...")
-                if telethon_client:
-                    await telethon_client.connect()
-                else:
-                    logger.error("Telethon client is None. Cannot reconnect.")
-                    is_authorized = False
-            else:
+            # PENTING: JANGAN coba connect Telethon di sini, gunakan runner yang sudah ada
+            # Cukup cek apakah client sudah connected dan authorized
+            if telethon_client and telethon_client.is_connected():
                 is_authorized = await telethon_client.is_user_authorized()
+                logger.info(f"Telethon client status: connected={telethon_client.is_connected()}, authorized={is_authorized}")
+            else:
+                logger.error("Telethon client is not connected or is None")
         except Exception as e:
             logger.error(f"Error checking Telethon connection: {e}")
-            is_authorized = False
             
         # Try Telethon first if authorized
         if is_authorized:
             try:
                 logger.info(f"Sending file to {user_id} via Telethon...")
                 
-                # Set up video attributes
-                attributes = [
-                    DocumentAttributeVideo(
-                        duration=int(video_duration),
-                        w=width,
-                        h=height,
-                        supports_streaming=True
-                    )
-                ]
+                def send_with_telethon():
+                    global telethon_loop, telethon_client
+                    # Bikin future untuk ngirim file
+                    if telethon_loop and not telethon_loop.is_closed():
+                        # Set up video attributes
+                        attributes = [
+                            DocumentAttributeVideo(
+                                duration=int(video_duration),
+                                w=width,
+                                h=height,
+                                supports_streaming=True
+                            )
+                        ]
+                        
+                        # Create task in telethon_loop
+                        future = asyncio.run_coroutine_threadsafe(
+                            telethon_client.send_file(
+                                user_id,
+                                file=send_file,
+                                caption=caption,
+                                attributes=attributes,
+                                supports_streaming=True
+                            ),
+                            telethon_loop
+                        )
+                        
+                        # Wait for result with timeout
+                        try:
+                            future.result(timeout=600)  # 10 menit timeout
+                            return True
+                        except Exception as e:
+                            logger.error(f"Error executing Telethon future: {e}")
+                            return False
+                    else:
+                        logger.error("Telethon loop is closed or None")
+                        return False
                 
-                # Send with timeout to prevent hanging
-                await asyncio.wait_for(
-                    telethon_client.send_file(
-                        user_id,
-                        file=send_file,
-                        caption=caption,
-                        attributes=attributes,
-                        supports_streaming=True
-                    ),
-                    timeout=600  # 10 minute timeout for large files
-                )
+                # Execute in a separate thread to avoid event loop issues
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                send_success = await asyncio.get_event_loop().run_in_executor(executor, send_with_telethon)
+                executor.shutdown(wait=False)
                 
-                send_success = True
-                logger.info(f"Successfully sent video to {user_id} via Telethon")
-                
-                # Update status message
-                await status_msg.edit_text("✅ Recording sent successfully as video!")
+                if send_success:
+                    logger.info(f"Successfully sent video to {user_id} via Telethon")
+                    
+                    # Update status message
+                    await status_msg.edit_text("✅ Recording sent successfully as video!")
+                else:
+                    logger.error("Failed to send via Telethon")
+                    await status_msg.edit_text(f"⚠️ Error with Telethon. Trying alternative method...")
                 
             except Exception as e:
                 logger.error(f"Error sending with Telethon: {e}")
@@ -2078,21 +1893,21 @@ async def send_recording(update: Update, context: CallbackContext, index: int):
                 # For files under 20MB, try sending as video for better playback
                 if send_size_mb <= 20:
                     with open(send_file, 'rb') as video_file:
+                        # REMOVED timeout parameter as it's not supported in your PTB version
                         await context.bot.send_video(
                             chat_id=user_id,
                             video=video_file,
                             caption=caption,
-                            supports_streaming=True,
-                            timeout=300  # 5 minute timeout
+                            supports_streaming=True
                         )
                 else:
                     # For files 20-50MB, send as document which is more reliable
                     with open(send_file, 'rb') as video_file:
+                        # REMOVED timeout parameter 
                         await context.bot.send_document(
                             chat_id=user_id,
                             document=video_file,
-                            caption=caption,
-                            timeout=300  # 5 minute timeout
+                            caption=caption
                         )
                 
                 send_success = True
@@ -2124,6 +1939,232 @@ async def send_recording(update: Update, context: CallbackContext, index: int):
             f"❌ Error sending the recording: {str(e)}\n"
             f"The file is available at: {os.path.basename(file_path)}"
         )
+
+
+# Fix untuk send_to_telegram function pada TikTokRecorder
+async def send_to_telegram(self, file_path, recording_duration):
+    """Send recorded file to Telegram users using Telethon"""
+    global telethon_client, telethon_loop
+    
+    db = init_database()
+    
+    if self.user not in db["tracked_accounts"]:
+        logger.error(f"Account {self.user} not found in tracked_accounts")
+        return
+        
+    account_info = db["tracked_accounts"][self.user]
+    
+    # Format duration
+    duration_str = format_duration(recording_duration)
+    
+    # Get file size
+    file_size_bytes = os.path.getsize(file_path)
+    file_size_mb = file_size_bytes / (1024 * 1024)
+    
+    logger.info(f"File size: {file_size_mb:.2f} MB")
+    
+    # Compress if too large (2GB limit for Telegram)
+    max_size = 2000 * 1024 * 1024  # 2GB in bytes
+    compressed_file = None
+    
+    if file_size_bytes > max_size:
+        logger.info(f"File too large for Telegram ({file_size_mb:.2f} MB). Compressing...")
+        
+        # Use smart compression to target size
+        compressed_file = VideoManagement.compress_video(file_path, 1900)  # Target ~1.9GB
+        
+        # Check compressed size
+        compressed_size_bytes = os.path.getsize(compressed_file)
+        compressed_size_mb = compressed_size_bytes / (1024 * 1024)
+        
+        logger.info(f"Compressed file size: {compressed_size_mb:.2f} MB")
+        
+        send_file = compressed_file
+        send_size_mb = compressed_size_mb
+    else:
+        send_file = file_path
+        send_size_mb = file_size_mb
+    
+    # Get video info for Telethon
+    video_info = VideoManagement.get_video_info(send_file)
+    width = video_info["width"] if video_info["width"] > 0 else 1280
+    height = video_info["height"] if video_info["height"] > 0 else 720
+    duration = video_info["duration"] if video_info["duration"] > 0 else recording_duration
+    
+    # Ensure Telethon client is connected - improved connection check
+    is_authorized = False
+    try:
+        # JANGAN coba connect ulang telethon di sini, gunakan client yg sudah berjalan
+        if telethon_client and telethon_client.is_connected():
+            is_authorized = await telethon_client.is_user_authorized()
+        else:
+            logger.error("Telethon client is not connected or is None")
+    except Exception as e:
+        logger.error(f"Error checking Telethon connection: {e}")
+    
+    # Send to all admin users
+    for admin_id in ADMIN_IDS:
+        try:
+            # Notify admin with bot API first
+            status_msg = await self.context.bot.send_message(
+                chat_id=admin_id,
+                text=f"📤 Sending recording of @{self.user}'s livestream ({send_size_mb:.2f} MB)...\n"
+                     f"🕒 This may take a few minutes."
+            )
+            
+            # Prepare caption - same for all methods
+            caption = (
+                f"🎬 Recording of @{self.user}'s livestream\n\n"
+                f"🆔 Room ID: {self.room_id}\n"
+                f"⏱️ Duration: {duration_str}\n"
+                f"📦 Size: {send_size_mb:.2f} MB\n"
+                f"🗓️ Recorded on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                f"{' (compressed)' if compressed_file else ''}"
+            )
+            
+            # Enhanced send logic with better fallback handling
+            send_success = False
+            
+            # Try Telethon first if authorized - with better event loop handling
+            if is_authorized:
+                try:
+                    logger.info(f"Sending file to {admin_id} via Telethon...")
+                    
+                    # Gunakan ThreadPoolExecutor agar tidak mengubah event loop
+                    def send_with_telethon():
+                        if telethon_loop and not telethon_loop.is_closed():
+                            # Use attributes to ensure it's sent as a video
+                            attributes = [
+                                DocumentAttributeVideo(
+                                    duration=int(duration) if duration else 0,
+                                    w=width if width else 1280,
+                                    h=height if height else 720,
+                                    supports_streaming=True
+                                )
+                            ]
+                            
+                            # Create future in telethon_loop
+                            future = asyncio.run_coroutine_threadsafe(
+                                telethon_client.send_file(
+                                    admin_id,
+                                    file=send_file,
+                                    caption=caption,
+                                    attributes=attributes,
+                                    supports_streaming=True
+                                ),
+                                telethon_loop
+                            )
+                            
+                            # Wait for result with timeout
+                            try:
+                                future.result(timeout=600)  # 10 minute timeout for large files
+                                return True
+                            except Exception as e:
+                                logger.error(f"Error executing Telethon future: {e}")
+                                return False
+                        else:
+                            logger.error("Telethon loop is closed or None")
+                            return False
+                    
+                    # Run in executor to avoid event loop issues
+                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                    send_success = await asyncio.get_event_loop().run_in_executor(executor, send_with_telethon)
+                    executor.shutdown(wait=False)
+                    
+                    if send_success:
+                        logger.info(f"Successfully sent video to {admin_id} via Telethon")
+                        
+                        # Update status
+                        await self.context.bot.edit_message_text(
+                            text=f"✅ Recording of @{self.user}'s livestream sent successfully!",
+                            chat_id=admin_id,
+                            message_id=status_msg.message_id
+                        )
+                    else:
+                        logger.error("Failed to send via Telethon")
+                        await self.context.bot.edit_message_text(
+                            text=f"⚠️ Error with Telethon. Trying alternative method...",
+                            chat_id=admin_id,
+                            message_id=status_msg.message_id
+                        )
+                    
+                except Exception as e:
+                    logger.error(f"Error sending with Telethon: {e}")
+                    
+                    # Update status about error, but don't break yet - will try fallback
+                    await self.context.bot.edit_message_text(
+                        text=f"⚠️ Error with Telethon: {str(e)}. Trying alternative method...",
+                        chat_id=admin_id,
+                        message_id=status_msg.message_id
+                    )
+            
+            # If Telethon failed or not available, try Bot API for small files
+            if not send_success and send_size_mb <= 50:
+                try:
+                    logger.info(f"Sending file to {admin_id} via Bot API...")
+                    
+                    # For files under 20MB, try sending as video for better playback
+                    if send_size_mb <= 20:
+                        with open(send_file, 'rb') as video_file:
+                            # REMOVED timeout parameter as it's not supported
+                            await self.context.bot.send_video(
+                                chat_id=admin_id,
+                                video=video_file,
+                                caption=caption,
+                                supports_streaming=True
+                            )
+                    else:
+                        # For files 20-50MB, send as document which is more reliable
+                        with open(send_file, 'rb') as video_file:
+                            # REMOVED timeout parameter
+                            await self.context.bot.send_document(
+                                chat_id=admin_id,
+                                document=video_file,
+                                caption=caption
+                            )
+                    
+                    send_success = True
+                    logger.info(f"Successfully sent video to {admin_id} via Bot API")
+                    
+                    # Update status
+                    await self.context.bot.edit_message_text(
+                        text=f"✅ Recording of @{self.user}'s livestream sent successfully via Bot API!",
+                        chat_id=admin_id,
+                        message_id=status_msg.message_id
+                    )
+                    
+                except Exception as e:
+                    logger.error(f"Error sending with Bot API: {e}")
+                    send_success = False
+            
+            # If all methods failed, send file path info
+            if not send_success:
+                await self.context.bot.edit_message_text(
+                    text=f"❌ Could not send recording automatically. Recording saved at: {os.path.basename(send_file)}",
+                    chat_id=admin_id,
+                    message_id=status_msg.message_id
+                )
+                
+        except Exception as e:
+            logger.error(f"Error in admin notification process for {admin_id}: {e}")
+            
+            # Final fallback - try to notify admin about the error
+            try:
+                await self.context.bot.send_message(
+                    chat_id=admin_id,
+                    text=f"❌ Error sending the recording: {str(e)}\n"
+                         f"Recording is saved at: {os.path.basename(send_file)}"
+                )
+            except:
+                # If even this fails, log but continue to other admins
+                logger.error(f"Complete failure to notify admin {admin_id}")
+    
+    # Clean up compressed file
+    if compressed_file and os.path.exists(compressed_file):
+        try:
+            os.remove(compressed_file)
+        except Exception as e:
+            logger.error(f"Error removing compressed file: {e}")
 
 async def start_recording_for_account(username: str, context: CallbackContext):
     """Start recording for a specific account"""
