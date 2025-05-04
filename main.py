@@ -1829,7 +1829,11 @@ async def show_recordings_list(update: Update, context: CallbackContext, page: i
             room_id = recording.get("room_id", "N/A")
             duration = recording.get("duration_seconds", 0)
             file_path = recording.get("file_path", "")
+            
+            # Escape any special Markdown characters in filenames
             file_name = os.path.basename(file_path)
+            file_name = file_name.replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("]", "\\]").replace("`", "\\`")
+            
             size_bytes = recording.get("size_bytes", 0)
             size_mb = size_bytes / (1024 * 1024) if size_bytes else 0
             
@@ -1846,7 +1850,10 @@ async def show_recordings_list(update: Update, context: CallbackContext, page: i
                 except:
                     pass
             
-            message += f"{i}. @{username}\n"
+            # Escape the username and any other potential Markdown characters
+            safe_username = username.replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("]", "\\]").replace("`", "\\`")
+            
+            message += f"{i}\\. @{safe_username}\n"
             message += f"   🆔 Room ID: {room_id}\n"
             message += f"   ⏱️ Duration: {duration_str}\n"
             message += f"   📂 File: {file_name}\n"
@@ -1882,10 +1889,23 @@ async def show_recordings_list(update: Update, context: CallbackContext, page: i
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    if hasattr(update, 'message') and update.message:
-        await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
-    else:
-        await update.callback_query.edit_message_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+    # Solusi alternatif: Gunakan HTML mode alih-alih Markdown untuk menghindari masalah parsing
+    try:
+        if hasattr(update, 'message') and update.message:
+            await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+        else:
+            await update.callback_query.edit_message_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+    except telegram.error.BadRequest as e:
+        # Jika masih error parsing, coba kirim tanpa parse mode
+        logger.error(f"Error sending message with Markdown: {e}")
+        
+        # Hilangkan formatting Markdown dari pesan
+        plain_message = message.replace("*", "").replace("_", "").replace("`", "").replace("\\", "")
+        
+        if hasattr(update, 'message') and update.message:
+            await update.message.reply_text(plain_message, reply_markup=reply_markup)
+        else:
+            await update.callback_query.edit_message_text(plain_message, reply_markup=reply_markup)
 
 async def send_recording(update: Update, context: CallbackContext, index: int):
     """Send a specific recording to the user via Telethon"""
