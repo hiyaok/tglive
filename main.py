@@ -15,7 +15,7 @@
 # - Telethon integration for sending videos
 
 # Token bot Telegram (ganti dengan token Anda)
-TELEGRAM_BOT_TOKEN = "7839177497:AAF4kpg0ezNzIS32NyYHTWunQVU3TRtJcWQ"
+TELEGRAM_BOT_TOKEN = "7839177497:AAGCvkN9ymsrwV2w6omrvnMQwJy1XDlUFQE"
 
 # Telethon API info (add your own)
 API_ID = 25649945  # Replace with your Telegram API ID
