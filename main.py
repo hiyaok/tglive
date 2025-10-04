@@ -15,14 +15,14 @@
 # - Telethon integration for sending videos
 
 # Token bot Telegram (ganti dengan token Anda)
-TELEGRAM_BOT_TOKEN = "7839177497"
+TELEGRAM_BOT_TOKEN = "8173917799:AAGQXTI6FLvJt0hqk-Fk-wRZ5MkMxVmGoxM"
 
 # Telethon API info (add your own)
 API_ID = 25649945  # Replace with your Telegram API ID
 API_HASH = "d91f3e307f5ee75e57136421f2c3adc6"  # Replace with your Telegram API Hash
 
 # List of admin user IDs (ganti dengan ID admin Anda)
-ADMIN_IDS = [1501581833]  # Replace with your actual admin Telegram user IDs
+ADMIN_IDS = [5988451717]  # Replace with your actual admin Telegram user IDs
 
 import os
 import json
